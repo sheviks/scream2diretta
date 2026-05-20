@@ -86,15 +86,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   This matches DRUP's `applyTransferMode()` logic exactly.
   (`diretta.cpp`)
 
-- **Startup log refactor**
-  When `--cycle-time` is not specified (or 0), s2d now auto-calculates the
-  target cycle time from the current audio format and MTU using the DRUP
-  formula: `cycle = (MTU - 24) / (sampleRate × channels × bps / 8) × 1e6`,
-  clamped to [100, 50000] µs. This gives ~280µs for CD-quality PCM,
-  ~130µs for 96k/24, and 100µs (clamped) for very high rates, instead of
-  the previous flat 200µs for all formats.
-  (`diretta.cpp`)
-
 - **Startup log refactor**: make the first-run output less noisy and more
   semantically grouped.
   - The data-flow overview line is now prefixed `[pipeline]` instead of
@@ -118,7 +109,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
-## [0.1] — Architecture convergence release
+## [0.1.0] - 2026-05-20
 
 ### Summary
 
