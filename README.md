@@ -118,7 +118,31 @@ After all, You can also use **aprenderer / aplayer** (Windows / Linux) as the Sc
 
 If you need to build **ScreamAlsa** from source, see the [ScreamAlsa project](https://github.com/Scream-Projects/scream-alsa).
 
-### Build Commands
+### Method 1: Install Script (Recommended)
+
+The interactive installer handles dependencies, auto-detects architecture, builds the binary, and optionally installs a systemd service.
+
+```bash
+bash scripts/install.sh
+```
+
+**What it does:**
+- Installs build dependencies (gcc, cmake, pkg-config)
+- Auto-detects `DIRETTA_ARCH_SUFFIX` from CPU flags / page size
+- Searches for Diretta SDK in project directory, parent, `$HOME`, `/opt`, `/usr/local`
+- Builds `scream2diretta`
+- Optionally installs systemd service with target selection
+
+**CLI shortcuts (non-interactive):**
+```bash
+bash scripts/install.sh --full      # Full install with service
+bash scripts/install.sh --build     # Build only
+bash scripts/install.sh --update    # Rebuild and update installed binary
+bash scripts/install.sh --test      # Verify installation and list targets
+bash scripts/install.sh --uninstall # Remove binary and service
+```
+
+### Method 2: Manual Build
 
 ```bash
 mkdir build && cd build

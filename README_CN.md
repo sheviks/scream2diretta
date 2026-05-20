@@ -118,7 +118,31 @@ LMS/Roon → upmpdcli → MPD → CamillaDSP → ScreamAlsa
 
 如需自行编译 **ScreamAlsa**，请前往 [ScreamAlsa 项目](https://github.com/Scream-Projects/scream-alsa)。
 
-### 编译命令
+### 方法一：安装脚本（推荐）
+
+交互式安装脚本会自动处理依赖、检测架构、编译二进制文件，并可选安装 systemd 服务。
+
+```bash
+bash scripts/install.sh
+```
+
+**功能：**
+- 安装编译依赖 (gcc, cmake, pkg-config)
+- 根据 CPU 标志 / 页大小自动检测 `DIRETTA_ARCH_SUFFIX`
+- 在项目目录、上级目录、`$HOME`、`/opt`、`/usr/local` 中搜索 Diretta SDK
+- 编译 `scream2diretta`
+- 可选安装 systemd 服务并选择目标设备
+
+**非交互式命令行快捷方式：**
+```bash
+bash scripts/install.sh --full      # 完整安装（含服务）
+bash scripts/install.sh --build     # 仅编译
+bash scripts/install.sh --update    # 重新编译并更新已安装的二进制文件
+bash scripts/install.sh --test      # 验证安装并列出目标设备
+bash scripts/install.sh --uninstall # 移除二进制文件和服务
+```
+
+### 方法二：手动编译
 
 ```bash
 mkdir build && cd build
