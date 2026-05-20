@@ -122,7 +122,18 @@ If you need to build **ScreamAlsa** from source, see the [ScreamAlsa project](ht
 
 ```bash
 mkdir build && cd build
-cmake -DDIRETTA_ENABLE=ON ..
+
+# Basic build (auto-detects architecture)
+cmake -DDIRETTA_ENABLE=ON -DDIRETTA_SDK_ROOT=../DirettaHostSDK_149 ..
+make -j$(nproc)
+
+# Full-featured build (explicit arch, static, no SDK logging)
+cmake -DDIRETTA_ENABLE=ON \
+      -DDIRETTA_SDK_ROOT=../DirettaHostSDK_149 \
+      -DDIRETTA_ARCH_SUFFIX=aarch64-linux-15k16 \
+      -DBUILD_STATIC=ON \
+      -DNOLOG=1 \
+      ..
 make -j$(nproc)
 ```
 
@@ -161,18 +172,6 @@ getconf PAGE_SIZE
 **musl libc:** If your system uses musl instead of glibc (e.g. Alpine Linux), append `-musl` to the base variant.
 
 **Production build:** Append `-nolog` to disable SDK internal logging (e.g. `aarch64-linux-15-nolog`).
-
-Override:
-```bash
-cmake -DDIRETTA_ARCH_SUFFIX=aarch64-linux-15k16 ..
-```
-
-### Static Binary
-
-```bash
-cmake -DBUILD_STATIC=ON ..
-make
-```
 
 Output: `scream2diretta-<ARCH_NAME>[-static]`
 

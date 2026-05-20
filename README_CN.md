@@ -122,7 +122,18 @@ LMS/Roon → upmpdcli → MPD → CamillaDSP → ScreamAlsa
 
 ```bash
 mkdir build && cd build
-cmake -DDIRETTA_ENABLE=ON ..
+
+# 基础编译 (自动检测架构)
+cmake -DDIRETTA_ENABLE=ON -DDIRETTA_SDK_ROOT=../DirettaHostSDK_149 ..
+make -j$(nproc)
+
+# 完整编译 (指定架构、静态链接、关闭 SDK 日志)
+cmake -DDIRETTA_ENABLE=ON \
+      -DDIRETTA_SDK_ROOT=../DirettaHostSDK_149 \
+      -DDIRETTA_ARCH_SUFFIX=aarch64-linux-15k16 \
+      -DBUILD_STATIC=ON \
+      -DNOLOG=1 \
+      ..
 make -j$(nproc)
 ```
 
@@ -161,18 +172,6 @@ getconf PAGE_SIZE
 **musl libc:** 如果你的系统使用 musl 而非 glibc (如 Alpine Linux)，在基础变体后附加 `-musl`。
 
 **生产构建:** 附加 `-nolog` 以禁用 SDK 内部日志 (如 `aarch64-linux-15-nolog`)。
-
-覆盖默认架构：
-```bash
-cmake -DDIRETTA_ARCH_SUFFIX=aarch64-linux-15k16 ..
-```
-
-### 静态二进制文件
-
-```bash
-cmake -DBUILD_STATIC=ON ..
-make
-```
 
 输出：`scream2diretta-<ARCH_NAME>[-static]`
 
