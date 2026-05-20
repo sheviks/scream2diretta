@@ -1,0 +1,22 @@
+# /etc/default/scream2diretta
+# Configuration for scream2diretta systemd service
+#
+# Run 'sudo scream2diretta --list-targets' to find available targets.
+
+# Diretta target index (1-based)
+TARGET=1
+
+# Scream UDP port
+PORT=4011
+
+# Additional options appended to the command line.
+# Examples:
+#   SCREAM2DIRETTA_OPTS="-i eth0 --stats --stats-interval 5 -vv"
+#   SCREAM2DIRETTA_OPTS="--pcm-buffer-ms 1000 --pcm-prefill-ms 500 --rebuffer-percent 50"
+#   SCREAM2DIRETTA_OPTS="--thread-mode 16641 --transfer-mode auto"
+#
+# For best sound quality, also consider:
+#   --cpu-scream 2 --cpu-audio 3 --cpu-other 1
+#
+# Default: conservative settings (no CPU affinity)
+SCREAM2DIRETTA_OPTS="--pcm-buffer-ms 1000 --pcm-prefill-ms 500 --rebuffer-percent 50"

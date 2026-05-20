@@ -1,0 +1,41 @@
+# Diretta SDK (proprietary, not redistributed)
+DirettaHostSDK_149/
+DirettaHostSDK_149_5.tar.zst
+
+# Claude Code internal files
+.claude/
+
+# Development docs (not for publication)
+TODO.md
+Q&A.md
+PARAMETERS.md
+ARCH_COMPARISON.md
+ARCHITECTURE_RISKS.md
+DSD_PLAN.md
+DRUP_Diretta_SDK_Optimizations.md
+DirettaRendererUPnP 与 Diretta SDK 的交互机制.md
+
+# Misc dev scripts
+scream2aac.sh
+shell.nix
+
+# Third-party projects / references (not part of s2d)
+Projects/
+scream-dsd-raw-pi5/
+
+# Build artifacts
+build/
+*.o
+*.a
+scream2diretta
+scream2diretta-*
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
