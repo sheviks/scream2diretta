@@ -130,15 +130,41 @@ make -j$(nproc)
 
 | `ARCH_NAME` | Platform |
 |-------------|----------|
+| `x64-linux-15v2` | x86-64 baseline (no AVX2) |
 | `x64-linux-15v3` | x86-64 with AVX2 (default) |
 | `x64-linux-15v4` | x86-64 with AVX-512 |
 | `x64-linux-15zen4` | AMD Zen 4 |
 | `aarch64-linux-15` | ARM64, 4KB pages |
 | `aarch64-linux-15k16` | ARM64, 16KB pages (RPi 5) |
+| `riscv64-linux-15` | RISC-V 64-bit |
+| `*-musl*` | musl libc variants (e.g. `aarch64-linux-15-musl`) |
+| `*-nolog` | SDK logging disabled (append to any variant) |
+
+#### How to determine your `ARCH_NAME`
+
+**x86-64:**
+```bash
+# Check CPU flags
+grep -m1 '^flags' /proc/cpuinfo
+```
+- Contains `avx512f` → use `x64-linux-15v4`
+- Contains `avx2` but **not** `avx512f` → use `x64-linux-15v3` (most common)
+- Neither → use `x64-linux-15v2`
+
+**ARM64:**
+```bash
+getconf PAGE_SIZE
+```
+- `16384` → `aarch64-linux-15k16` (Raspberry Pi 5)
+- `4096` → `aarch64-linux-15` (most other ARM64 boards)
+
+**musl libc:** If your system uses musl instead of glibc (e.g. Alpine Linux), append `-musl` to the base variant.
+
+**Production build:** Append `-nolog` to disable SDK internal logging (e.g. `aarch64-linux-15-nolog`).
 
 Override:
 ```bash
-cmake -DARCH_NAME=aarch64-linux-15k16 ..
+cmake -DDIRETTA_ARCH_SUFFIX=aarch64-linux-15k16 ..
 ```
 
 ### Static Binary

@@ -130,15 +130,41 @@ make -j$(nproc)
 
 | `ARCH_NAME` | 平台 |
 |-------------|------|
+| `x64-linux-15v2` | x86-64 基线 (无 AVX2) |
 | `x64-linux-15v3` | x86-64 AVX2 (默认) |
 | `x64-linux-15v4` | x86-64 AVX-512 |
 | `x64-linux-15zen4` | AMD Zen 4 |
 | `aarch64-linux-15` | ARM64, 4KB 页 |
 | `aarch64-linux-15k16` | ARM64, 16KB 页 (树莓派 5) |
+| `riscv64-linux-15` | RISC-V 64-bit |
+| `*-musl*` | musl libc 变体 (如 `aarch64-linux-15-musl`) |
+| `*-nolog` | 禁用 SDK 内部日志 (附加到任意变体) |
+
+#### 如何确定你的 `ARCH_NAME`
+
+**x86-64:**
+```bash
+# 查看 CPU 指令集标志
+grep -m1 '^flags' /proc/cpuinfo
+```
+- 包含 `avx512f` → 使用 `x64-linux-15v4`
+- 包含 `avx2` 但 **不含** `avx512f` → 使用 `x64-linux-15v3` (最常见)
+- 两者皆无 → 使用 `x64-linux-15v2`
+
+**ARM64:**
+```bash
+getconf PAGE_SIZE
+```
+- `16384` → `aarch64-linux-15k16` (树莓派 5)
+- `4096` → `aarch64-linux-15` (大多数其他 ARM64 开发板)
+
+**musl libc:** 如果你的系统使用 musl 而非 glibc (如 Alpine Linux)，在基础变体后附加 `-musl`。
+
+**生产构建:** 附加 `-nolog` 以禁用 SDK 内部日志 (如 `aarch64-linux-15-nolog`)。
 
 覆盖默认架构：
 ```bash
-cmake -DARCH_NAME=aarch64-linux-15k16 ..
+cmake -DDIRETTA_ARCH_SUFFIX=aarch64-linux-15k16 ..
 ```
 
 ### 静态二进制文件
