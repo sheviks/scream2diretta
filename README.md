@@ -58,7 +58,7 @@ The steady-state hot path is a **two-thread SPSC architecture**: receiver pushes
 
 ### Use Case 1: Non-UPnP Music Services (Desktop, Mobile, Portable Players)
 
-Apple Music, Spotify, and Tidal do not support UPnP streaming. You cannot send an HTTP stream to DRUP from these apps.
+Apple Music, Spotify do not support UPnP streaming. You cannot send an HTTP stream to DRUP from these apps.
 
 **Desktop (Windows / Linux / macOS)**: For apps like Foobar2000 or Spotify Desktop that can use ASIO / ScreamAlsa, output directly to **ScreamAlsa** (or ASIOScream on Windows). The PCM is sent over UDP to a Raspberry Pi running **scream2diretta**.
 
@@ -67,18 +67,18 @@ Apple Music, Spotify, and Tidal do not support UPnP streaming. You cannot send a
 This can run on a **single machine** (USB gadget + ScreamAlsa + scream2diretta on one Pi) or in **dual-machine mode** (USB gadget/ScreamAlsa sender → network → dedicated scream2diretta receiver). Dual-machine is recommended for best sound quality.
 
 ```text
-Desktop:   Foobar2000 / Spotify → ASIOScream / ScreamAlsa → network → scream2diretta → DAC
+Desktop:   Foobar2000 / Spotify → ASIOScream / ScreamAlsa → network → scream2diretta → Diretta Target → DAC
 
 Mobile:    iPhone / Fiio M21 → USB gadget (Raspberry Pi)
                                       ↓
                                 CamillaDSP (optional)
                                       ↓
-                                ScreamAlsa → network → scream2diretta → DAC
+                                ScreamAlsa → network → scream2diretta → Diretta Target → DAC
 ```
 
 ### Use Case 2: HQPlayer / NAA without DirettaAlsaHost
 
-HQPlayer with Network Audio Adapter (NAA) does not natively support Diretta. Traditionally, you would need **DirettaAlsaHost** as an intermediary ALSA plugin to bridge NAA output to a Diretta Target.
+HQPlayer / NAA (Network Audio Adapter) does not natively support Diretta. Traditionally, you would need **DirettaAlsaHost** as an intermediary ALSA plugin to bridge NAA output to a Diretta Target.
 
 **Solution**: Configure NAA to output to **ScreamAlsa** instead. The PCM stream is sent over the network to **scream2diretta**, which bypasses the ALSA layer entirely and feeds the Diretta Target directly.
 
@@ -99,10 +99,12 @@ LMS/Roon → upmpdcli → MPD → CamillaDSP → ScreamAlsa
                                                ↓
                                           network
                                                ↓
-                                        scream2diretta → DAC
+                                        scream2diretta → Diretta Target → DAC
 ```
 
 This gives you full UPnP compatibility **with** DSP processing, something that is difficult to achieve with DRUP alone.
+
+After all, You can also use **aprenderer / aplayer** (Windows / Linux) as the Scream sender and play directly to **scream2diretta**.
 
 ---
 
@@ -112,7 +114,9 @@ This gives you full UPnP compatibility **with** DSP processing, something that i
 
 - C++17 compiler (gcc 11+, clang 13+)
 - CMake 3.7+
-- Diretta Host SDK (e.g. `DirettaHostSDK_149`) — not redistributed
+- Diretta Host SDK (e.g. `DirettaHostSDK_149`) — see [DirettaRendererUPnP](https://github.com/cometdom/DirettaRendererUPnP) or [slim2Diretta](https://github.com/cometdom/slim2Diretta) for acquisition instructions
+
+If you need to build **ScreamAlsa** from source, see the [ScreamAlsa project](https://github.com/Scream-Projects/scream-alsa).
 
 ### Build Commands
 
@@ -165,8 +169,7 @@ sudo ./scream2diretta -t 1 -p 4011 -vv --stats --stats-interval 5
 # With CPU affinity (recommended for best sound quality)
 sudo ./scream2diretta -t 1 -p 4011 \
   --cpu-scream 2 --cpu-audio 3 --cpu-other 1 \
-  --thread-mode 16641 --transfer-mode auto \
-  --stats --stats-interval 5 -vv
+  --thread-mode 1 --transfer-mode auto
 ```
 
 ### Parameter Reference
@@ -180,6 +183,7 @@ sudo ./scream2diretta -t 1 -p 4011 \
 | `-g <group>` | 239.255.77.77 | Multicast group address (multicast mode only) |
 | `--thread-mode <mask>` | 1 (CRITICAL) | SDK thread mode bitmask |
 | `--transfer-mode <mode>` | auto | auto / varmax / varauto / fixauto / random |
+| `--mtu <bytes>` | auto | Network MTU (default auto-detect, usually 9000 for jumbo frames) |
 | `--pcm-buffer-ms <ms>` | 1000 | PcmRing total size |
 | `--pcm-prefill-ms <ms>` | 500 | Fill threshold before first pull |
 | `--rebuffer-percent <pct>` | 50 | Resume threshold after underrun |

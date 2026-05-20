@@ -67,18 +67,18 @@ Apple Music、Spotify 和 Tidal 不支持 UPnP 串流。你无法从这些应用
 可以运行在**单机模式**（USB gadget + ScreamAlsa + scream2diretta 在同一台树莓派上），也可以采用**双机模式**（USB gadget/ScreamAlsa 发送端 → 网络 → 独立的 scream2diretta 接收端）。推荐双机模式以获得最佳音质。
 
 ```text
-桌面端：  Foobar2000 / Spotify → ASIOScream / ScreamAlsa → 网络 → scream2diretta → DAC
+桌面端：  Foobar2000 / Spotify → ASIOScream / ScreamAlsa → 网络 → scream2diretta → Diretta 目标 → DAC
 
 移动端：  iPhone / Fiio M21 → USB gadget (树莓派)
                                       ↓
                                 CamillaDSP (可选)
                                       ↓
-                                ScreamAlsa → 网络 → scream2diretta → DAC
+                                ScreamAlsa → 网络 → scream2diretta → Diretta 目标 → DAC
 ```
 
 ### 场景 2：HQPlayer / NAA 无需 DirettaAlsaHost
 
-HQPlayer 配合 Network Audio Adapter (NAA) 原生不支持 Diretta。传统上，你需要 **DirettaAlsaHost** 作为 ALSA 插件中间层，将 NAA 输出桥接到 Diretta 目标设备。
+HQPlayer / NAA（Network Audio Adapter）原生不支持 Diretta。传统上，你需要 **DirettaAlsaHost** 作为 ALSA 插件中间层，将 NAA 输出桥接到 Diretta 目标设备。
 
 **解决方案**：将 NAA 配置为输出到 **ScreamAlsa**。PCM 流通过网络发送到 **scream2diretta**，完全绕过 ALSA 层，直接送入 Diretta 目标设备。
 
@@ -99,10 +99,12 @@ LMS/Roon → upmpdcli → MPD → CamillaDSP → ScreamAlsa
                                                ↓
                                           网络
                                                ↓
-                                        scream2diretta → DAC
+                                        scream2diretta → Diretta 目标 → DAC
 ```
 
 这让你获得完整的 UPnP 兼容性**并支持** DSP 处理，这是仅用 DRUP 难以实现的。
+
+你也可以使用 **aprenderer / aplayer**（Windows / Linux）作为 Scream 发送端，直接播放给 **scream2diretta**。
 
 ---
 
@@ -112,7 +114,9 @@ LMS/Roon → upmpdcli → MPD → CamillaDSP → ScreamAlsa
 
 - C++17 编译器 (gcc 11+, clang 13+)
 - CMake 3.7+
-- Diretta Host SDK (如 `DirettaHostSDK_149`) —— 不随本项目分发
+- Diretta Host SDK (如 `DirettaHostSDK_149`) —— 获取方式参见 [DirettaRendererUPnP](https://github.com/cometdom/DirettaRendererUPnP) 或 [slim2Diretta](https://github.com/cometdom/slim2Diretta) 项目主页
+
+如需自行编译 **ScreamAlsa**，请前往 [ScreamAlsa 项目](https://github.com/Scream-Projects/scream-alsa)。
 
 ### 编译命令
 
@@ -165,8 +169,7 @@ sudo ./scream2diretta -t 1 -p 4011 -vv --stats --stats-interval 5
 # 使用 CPU 亲和性（推荐用于最佳音质）
 sudo ./scream2diretta -t 1 -p 4011 \
   --cpu-scream 2 --cpu-audio 3 --cpu-other 1 \
-  --thread-mode 16641 --transfer-mode auto \
-  --stats --stats-interval 5 -vv
+  --thread-mode 1 --transfer-mode auto
 ```
 
 ### 参数参考
@@ -180,6 +183,7 @@ sudo ./scream2diretta -t 1 -p 4011 \
 | `-g <group>` | 239.255.77.77 | 组播组地址（仅组播模式） |
 | `--thread-mode <mask>` | 1 (CRITICAL) | SDK 线程模式位掩码 |
 | `--transfer-mode <mode>` | auto | auto / varmax / varauto / fixauto / random |
+| `--mtu <bytes>` | auto | 网络 MTU（默认自动检测，巨型帧通常为 9000） |
 | `--pcm-buffer-ms <ms>` | 1000 | PcmRing 总大小 |
 | `--pcm-prefill-ms <ms>` | 500 | 首次拉取前的填充阈值 |
 | `--rebuffer-percent <pct>` | 50 | 欠载恢复阈值 |
