@@ -88,6 +88,8 @@ HQPlayer → NAA → ScreamAlsa → network → scream2diretta → Diretta Targe
 
 这消除了 DirettaAlsaHost 引入的 ALSA 周期/缓冲区/唤醒抖动。
 
+> **注意：** HQPlayer 和 NAA 的设计初衷是与音频硬件直接交互。此链路并非 HQPlayer 的推荐使用方式，而是在没有原生 NAA→Diretta 通路时，除 DirettaAlsaHost 之外的另一种选择，用于将 HQPlayer 升频后的 PCM 传输至 Diretta Target。
+
 ### 场景 3：UPnP 流的 DSP 处理
 
 DRUP 直接接收 HTTP 流并传递给 Diretta SDK。然而，在这条路径中**没有方便的 DSP 处理钩子**。

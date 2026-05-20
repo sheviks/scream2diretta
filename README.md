@@ -88,6 +88,8 @@ HQPlayer → NAA → ScreamAlsa → network → scream2diretta → Diretta Targe
 
 This eliminates the ALSA period/buffer/wakeup jitter that DirettaAlsaHost introduces.
 
+> **Note:** HQPlayer and NAA are designed to interface directly with audio hardware. This chain is provided as an alternative to DirettaAlsaHost, not as the recommended way to use HQPlayer. It allows you to route HQPlayer-upsampled PCM to a Diretta Target when a native NAA→Diretta path does not exist.
+
 ### Use Case 3: DSP Processing for UPnP Streams
 
 DRUP accepts HTTP streams directly and passes them to the Diretta SDK. However, there is **no convenient hook for DSP processing** in this path.
