@@ -38,6 +38,7 @@ extern "C" {
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <thread>
@@ -46,6 +47,8 @@ extern "C" {
 #if defined(__linux__)
 #include <pthread.h>
 #include <sched.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #endif
 
 using namespace DIRETTA;
@@ -125,6 +128,10 @@ struct DirettaState {
     // Cached cycle values from the last successful open, for stats output.
     uint64_t target_cycle_us = 0;
     uint64_t sdk_cycle_us = 0;
+
+    // Inferred protocol overhead (MTU - per-packet payload), learned from
+    // the first successful SDK open.  -1 = not yet inferred.
+    int inferred_overhead = -1;
 
     // Last format we successfully built a FormatConfigure for.
     FormatConfigure last_fc{};
@@ -777,13 +784,68 @@ static std::string ip_to_str(const IPAddress& a) {
     return s;
 }
 
+// Overhead cache helpers -----------------------------------------------------
+
+static std::string overhead_cache_dir() {
+    const char* home = std::getenv("HOME");
+    if (!home || !home[0]) home = "/tmp";
+    return std::string(home) + "/.config/scream2diretta";
+}
+
+static std::string overhead_cache_file(const IPAddress& addr) {
+    std::string s = ip_to_str(addr);
+    // Sanitise for use as a filename: replace : % , with safe chars.
+    for (char& c : s) {
+        if (c == ':') c = '_';
+        else if (c == '%') c = '-';
+        else if (c == ',') c = '.';
+    }
+    return overhead_cache_dir() + "/overhead-" + s + ".txt";
+}
+
+static void ensure_cache_dir() {
+    const std::string dir = overhead_cache_dir();
+#if defined(__linux__)
+    struct stat st;
+    if (stat(dir.c_str(), &st) != 0) {
+        // Create parent ~/.config if needed, then our subdir.
+        const char* home = std::getenv("HOME");
+        if (home && home[0]) {
+            std::string parent = std::string(home) + "/.config";
+            if (stat(parent.c_str(), &st) != 0) {
+                mkdir(parent.c_str(), 0755);
+            }
+        }
+        mkdir(dir.c_str(), 0755);
+    }
+#endif
+}
+
+static int load_inferred_overhead(const IPAddress& addr) {
+    const std::string path = overhead_cache_file(addr);
+    std::ifstream f(path);
+    if (!f) return -1;
+    int val = -1;
+    if (f >> val && val > 0 && val < 200) return val;
+    return -1;
+}
+
+static void save_inferred_overhead(const IPAddress& addr, int overhead) {
+    if (overhead <= 0 || overhead >= 200) return;
+    ensure_cache_dir();
+    const std::string path = overhead_cache_file(addr);
+    std::ofstream f(path);
+    if (f) f << overhead << "\n";
+}
+
 // Dynamic cycle-time calculation matching DRUP / slim2Diretta.
 // When cycle_us == 0 (auto), compute the interval needed to send one
 // full efficient-MTU packet worth of audio at the current format.
 static unsigned int calculateCycleTime(uint32_t sampleRate,
                                        uint32_t channels,
                                        uint32_t bitsPerSample,
-                                       uint32_t mtu)
+                                       uint32_t mtu,
+                                       int inferredOverhead)
 {
     // OVERHEAD depends on MTU measurement semantics:
     //  - Jumbo frames (MTU > 2000): measSendMTU returns IP-layer MTU,
@@ -791,12 +853,16 @@ static unsigned int calculateCycleTime(uint32_t sampleRate,
     //  - Standard frames (MTU ≤ 2000): measSendMTU returns link-layer
     //    frame size (incl. Ethernet header + FCS + possible VLAN tag),
     //    overhead ≈ 22 bytes (observed: 1518 → 1496).
-    //  Use 3 as a compromise for standard frames to avoid effMtu being
-    //    too small; the exact value is not critical for VarMax because
-    //    SDK selects packet count as an integer multiple.
-    const int OVERHEAD = (mtu > 2000u) ? 6 : 3;
-    const uint32_t effMtu = (mtu > static_cast<uint32_t>(OVERHEAD))
-                                ? (mtu - OVERHEAD)
+    // If we have previously inferred the actual overhead from SDK feedback,
+    // use it; otherwise fall back to defaults.
+    int overhead;
+    if (inferredOverhead > 0 && inferredOverhead < 200) {
+        overhead = inferredOverhead;
+    } else {
+        overhead = (mtu > 2000u) ? 6 : 6;  // default 6 for both paths
+    }
+    const uint32_t effMtu = (mtu > static_cast<uint32_t>(overhead))
+                                ? (mtu - overhead)
                                 : 1476u;
     const double bytesPerSecond = static_cast<double>(sampleRate)
                                   * static_cast<double>(channels)
@@ -817,7 +883,8 @@ static const char* apply_transfer_mode(Sync& sb, const diretta_config_t& cfg) {
                              g_st.bits_per_sample,
                              cfg.mtu_override > 0
                                  ? static_cast<uint32_t>(cfg.mtu_override)
-                                 : g_st.mtu);
+                                 : g_st.mtu,
+                             g_st.inferred_overhead);
     const Clock cycle    = Clock::MicroSeconds(cycle_us);
     const Clock cycleMin = (cfg.cycle_min_us > 0)
         ? Clock::MicroSeconds(cfg.cycle_min_us)
@@ -1534,7 +1601,8 @@ static uint32_t open_sync_worker_blocking(scream_diretta::ScreamDirettaSync*& ou
             : g_st.mtu;
         const int target_cycle = cfg.cycle_us > 0 ? cfg.cycle_us
             : (int)calculateCycleTime(g_st.sample_rate, g_st.channels,
-                                      g_st.bits_per_sample, eff_mtu);
+                                      g_st.bits_per_sample, eff_mtu,
+                                      g_st.inferred_overhead);
         const long long sdk_cycle = (long long)(sync->getCycleTime().getMicroSeconds());
         DLOG(2, "transfer: mtu=%u mode=%s target_cycle=%dus sdk_cycle=%lldus "
              "cycle_size=%zuB cycle_packets=%zu",
@@ -1543,6 +1611,24 @@ static uint32_t open_sync_worker_blocking(scream_diretta::ScreamDirettaSync*& ou
              (size_t)sync->getCyclePackets());
         g_st.target_cycle_us = static_cast<uint64_t>(target_cycle);
         g_st.sdk_cycle_us = static_cast<uint64_t>(sdk_cycle);
+
+        // Infer actual protocol overhead from SDK feedback.
+        // cycle_size is the per-packet PCM payload; eff_mtu - cycle_size
+        // equals the real overhead (Ethernet + DDS + FCS + padding).
+        if (g_st.inferred_overhead < 0) {
+            const size_t cs = sync->getCycleSize();
+            const int inferred = static_cast<int>(eff_mtu) - static_cast<int>(cs);
+            if (inferred > 0 && inferred < 200) {
+                g_st.inferred_overhead = inferred;
+                DLOG(1, "inferred overhead: %d (mtu=%u cycle_size=%zu packets=%zu)",
+                     inferred, (unsigned)eff_mtu, cs,
+                     (size_t)sync->getCyclePackets());
+                save_inferred_overhead(g_st.sink_addr, inferred);
+            } else {
+                DLOG(1, "overhead inference skipped: mtu=%u cycle_size=%zu "
+                     "raw_inferred=%d", (unsigned)eff_mtu, cs, inferred);
+            }
+        }
     }
     dbg_event("setConfigTransfer_return", "");
 
@@ -2699,6 +2785,14 @@ extern "C" int diretta_output_init(const diretta_config_t *cfg) {
     }
 
     g_st.sink_addr = targets[pick].portAddr;
+
+    // Load cached inferred overhead for this target, if available.
+    g_st.inferred_overhead = load_inferred_overhead(g_st.sink_addr);
+    if (g_st.inferred_overhead > 0) {
+        DLOG(1, "loaded cached overhead: %d for %s",
+             g_st.inferred_overhead, ip_to_str(g_st.sink_addr).c_str());
+    }
+
     if (g_st.cfg.mtu_override > 0) {
         g_st.mtu = (uint32_t)g_st.cfg.mtu_override;
     } else {
