@@ -269,7 +269,7 @@ typedef struct diretta_stats_s {
     uint64_t underrun_events;
     uint64_t popped_bytes;
     uint64_t target_cycle_us;   /* configured target cycle at last open */
-    uint64_t actual_cycle_us;   /* SDK reported cycle at last open */
+    uint64_t sdk_cycle_us;      /* SDK generated transmission interval at last open */
     /* DSD diagnostics */
     uint64_t dsd_active;        /* 1 if current format is DSD */
     uint64_t dsd_multiplier;    /* 1=DSD64, 2=DSD128, 4=DSD256, 8=DSD512 */

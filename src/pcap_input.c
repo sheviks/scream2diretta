@@ -1,4 +1,4 @@
-#include "pcap.h"
+#include "pcap_input.h"
 
 static pcap_t *handle;
 static int (*pcap_output_callback)(receiver_data_t* receiver_data);
@@ -38,6 +38,7 @@ int init_pcap(const char* interface_name, int port, char* multicast_group) {
     fprintf(stderr, "libpcap install filter %s: %s\n", filter_exp, pcap_geterr(handle));
     return 4;
   }
+  return 0;
 }
 
 void pcap_callback(u_char *args, const struct pcap_pkthdr *header, const u_char *pkg)

@@ -36,7 +36,7 @@
 #endif
 
 #if PCAP_ENABLE
-#include "pcap.h"
+#include "pcap_input.h"
 #endif
 
 #if JACK_ENABLE

@@ -25,6 +25,21 @@ print_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
 print_error()   { echo -e "${RED}[ERROR]${NC} $1"; }
 print_header()  { echo -e "\n${CYAN}=== $1 ===${NC}\n"; }
 
+# Run command with root privileges.
+# If already root, run directly.
+# If not root, try sudo. If sudo is not available, error out.
+run_privileged() {
+    if [ "$EUID" -eq 0 ]; then
+        "$@"
+    elif command -v sudo >/dev/null 2>&1; then
+        sudo "$@"
+    else
+        print_error "Root privileges required but sudo is not available."
+        print_info "Please run this script as root or install sudo."
+        exit 1
+    fi
+}
+
 confirm() {
     local prompt="$1"
     local default="${2:-N}"
@@ -68,8 +83,12 @@ detect_arch_name() {
 detect_system() {
     print_header "System Detection"
     if [ "$EUID" -eq 0 ]; then
-        print_error "Please do not run this script as root"
-        print_info "The script will ask for sudo password when needed"
+        print_warning "Running as root (sudo is not required)"
+    elif command -v sudo >/dev/null 2>&1; then
+        print_info "Running as non-root user; sudo will be used for privileged operations"
+    else
+        print_error "This script requires root privileges, but sudo is not available."
+        print_info "Please run as root, install sudo, or use a system that supports it (e.g., GentooPlayer should be run as root)."
         exit 1
     fi
     if [ -f /etc/os-release ]; then
@@ -108,14 +127,14 @@ install_dependencies() {
     print_header "Installing Build Dependencies"
     case $OS in
         fedora|rhel|centos)
-            sudo dnf install -y gcc-c++ make cmake pkgconfig
+            run_privileged dnf install -y gcc-c++ make cmake pkgconfig
             ;;
         ubuntu|debian|dietpi)
-            sudo apt update
-            sudo apt install -y build-essential cmake pkg-config
+            run_privileged apt update
+            run_privileged apt install -y build-essential cmake pkg-config
             ;;
         arch|archarm|manjaro)
-            sudo pacman -Sy --needed --noconfirm base-devel cmake pkgconf
+            run_privileged pacman -Sy --needed --noconfirm base-devel cmake pkgconf
             ;;
         *)
             print_error "Unsupported distribution: $OS"
@@ -203,22 +222,22 @@ setup_systemd_service() {
         return 0
     fi
     print_info "Installing binary..."
-    sudo cp "$BINARY_PATH" "$INSTALL_BIN/scream2diretta"
-    sudo chmod +x "$INSTALL_BIN/scream2diretta"
+    run_privileged cp "$BINARY_PATH" "$INSTALL_BIN/scream2diretta"
+    run_privileged chmod +x "$INSTALL_BIN/scream2diretta"
     print_success "Binary installed: $INSTALL_BIN/scream2diretta"
     print_info "Installing systemd service..."
-    sudo cp "$SCRIPT_DIR/scripts/scream2diretta.service" "$SERVICE_FILE"
+    run_privileged cp "$SCRIPT_DIR/scripts/scream2diretta.service" "$SERVICE_FILE"
     print_success "Service file installed: $SERVICE_FILE"
     print_info "Installing configuration file..."
     if [ ! -f "$CONFIG_FILE" ]; then
-        sudo cp "$SCRIPT_DIR/scripts/scream2diretta.default" "$CONFIG_FILE"
+        run_privileged cp "$SCRIPT_DIR/scripts/scream2diretta.default" "$CONFIG_FILE"
         print_success "Configuration file installed: $CONFIG_FILE"
     else
         if ! diff -q "$SCRIPT_DIR/scripts/scream2diretta.default" "$CONFIG_FILE" > /dev/null 2>&1; then
             print_warning "Configuration file has changed in this version"
             if confirm "Update configuration file? (old file backed up as .bak)"; then
-                sudo cp "$CONFIG_FILE" "${CONFIG_FILE}.bak"
-                sudo cp "$SCRIPT_DIR/scripts/scream2diretta.default" "$CONFIG_FILE"
+                run_privileged cp "$CONFIG_FILE" "${CONFIG_FILE}.bak"
+                run_privileged cp "$SCRIPT_DIR/scripts/scream2diretta.default" "$CONFIG_FILE"
                 print_success "Configuration updated (backup: ${CONFIG_FILE}.bak)"
             else
                 print_info "Keeping current configuration"
@@ -228,17 +247,17 @@ setup_systemd_service() {
         fi
     fi
     print_info "Reloading systemd daemon..."
-    sudo systemctl daemon-reload
+    run_privileged systemctl daemon-reload
     echo ""
     print_info "Listing available Diretta targets..."
-    sudo "$INSTALL_BIN/scream2diretta" --list-targets 2>&1 || true
+    run_privileged "$INSTALL_BIN/scream2diretta" --list-targets 2>&1 || true
     echo ""
     read -p "Enter Diretta target number to enable (e.g., 1) or press Enter to skip: " TARGET_NUM
     if [ -n "$TARGET_NUM" ]; then
         if [ -f "$CONFIG_FILE" ]; then
-            sudo sed -i "s/^TARGET=.*/TARGET=${TARGET_NUM}/" "$CONFIG_FILE"
+            run_privileged sed -i "s/^TARGET=.*/TARGET=${TARGET_NUM}/" "$CONFIG_FILE"
         fi
-        sudo systemctl enable scream2diretta.service
+        run_privileged systemctl enable scream2diretta.service
         print_success "Service enabled with target $TARGET_NUM (starts on boot)"
     fi
     echo ""
@@ -275,18 +294,18 @@ update_binary() {
     fi
     if systemctl is-active --quiet scream2diretta.service 2>/dev/null; then
         print_info "Stopping service..."
-        sudo systemctl stop scream2diretta.service
+        run_privileged systemctl stop scream2diretta.service
     fi
-    sudo cp "$BINARY_PATH" "$INSTALL_BIN/scream2diretta"
-    sudo chmod +x "$INSTALL_BIN/scream2diretta"
+    run_privileged cp "$BINARY_PATH" "$INSTALL_BIN/scream2diretta"
+    run_privileged chmod +x "$INSTALL_BIN/scream2diretta"
     if [ -f "$SERVICE_FILE" ]; then
-        sudo cp "$SCRIPT_DIR/scripts/scream2diretta.service" "$SERVICE_FILE"
-        sudo systemctl daemon-reload
+        run_privileged cp "$SCRIPT_DIR/scripts/scream2diretta.service" "$SERVICE_FILE"
+        run_privileged systemctl daemon-reload
     fi
     print_success "Binary updated: $INSTALL_BIN/scream2diretta"
     if systemctl is-active --quiet scream2diretta.service 2>/dev/null; then
         print_info "Restarting service..."
-        sudo systemctl start scream2diretta.service
+        run_privileged systemctl start scream2diretta.service
     fi
     print_success "Update complete!"
 }
@@ -315,7 +334,7 @@ test_installation() {
     fi
     echo ""
     print_info "Searching for Diretta targets..."
-    sudo timeout 10 "$BINARY" --list-targets 2>&1 || {
+    run_privileged timeout 10 "$BINARY" --list-targets 2>&1 || {
         local exit_code=$?
         if [ $exit_code -eq 124 ]; then
             print_info "Target search timed out (normal if no targets found)"
@@ -345,21 +364,21 @@ uninstall() {
         print_info "Uninstall cancelled"
         return 0
     fi
-    sudo systemctl stop scream2diretta.service 2>/dev/null || true
-    sudo systemctl disable scream2diretta.service 2>/dev/null || true
+    run_privileged systemctl stop scream2diretta.service 2>/dev/null || true
+    run_privileged systemctl disable scream2diretta.service 2>/dev/null || true
     print_info "Stopped and disabled service"
     if [ -f "$INSTALL_BIN/scream2diretta" ]; then
-        sudo rm "$INSTALL_BIN/scream2diretta"
+        run_privileged rm "$INSTALL_BIN/scream2diretta"
         print_success "Binary removed"
     fi
     if [ -f "$SERVICE_FILE" ]; then
-        sudo rm "$SERVICE_FILE"
-        sudo systemctl daemon-reload
+        run_privileged rm "$SERVICE_FILE"
+        run_privileged systemctl daemon-reload
         print_success "Service file removed"
     fi
     if [ -f "$CONFIG_FILE" ]; then
         if confirm "Remove configuration file ($CONFIG_FILE)?"; then
-            sudo rm "$CONFIG_FILE"
+            run_privileged rm "$CONFIG_FILE"
             print_success "Configuration removed"
         else
             print_info "Configuration kept: $CONFIG_FILE"

@@ -124,7 +124,7 @@ struct DirettaState {
 
     // Cached cycle values from the last successful open, for stats output.
     uint64_t target_cycle_us = 0;
-    uint64_t actual_cycle_us = 0;
+    uint64_t sdk_cycle_us = 0;
 
     // Last format we successfully built a FormatConfigure for.
     FormatConfigure last_fc{};
@@ -785,12 +785,16 @@ static unsigned int calculateCycleTime(uint32_t sampleRate,
                                        uint32_t bitsPerSample,
                                        uint32_t mtu)
 {
-    // SDK's actual Diretta protocol overhead is 6 bytes (observed from
-    // getCycleSize() with jumbo frames: MTU=9014 → payload=9008).
-    // OVERHEAD=3 causes effMtu > SDK_payload, triggering packet doubling
-    // in VarMax mode (actual_cycle ≈ 2× target). OVERHEAD=6 matches
-    // exactly. OVERHEAD=24 was overly conservative.
-    constexpr int OVERHEAD = 6;
+    // OVERHEAD depends on MTU measurement semantics:
+    //  - Jumbo frames (MTU > 2000): measSendMTU returns IP-layer MTU,
+    //    overhead ≈ 6 bytes (observed: 9014 → 9008).
+    //  - Standard frames (MTU ≤ 2000): measSendMTU returns link-layer
+    //    frame size (incl. Ethernet header + FCS + possible VLAN tag),
+    //    overhead ≈ 22 bytes (observed: 1518 → 1496).
+    //  Use 3 as a compromise for standard frames to avoid effMtu being
+    //    too small; the exact value is not critical for VarMax because
+    //    SDK selects packet count as an integer multiple.
+    const int OVERHEAD = (mtu > 2000u) ? 6 : 3;
     const uint32_t effMtu = (mtu > static_cast<uint32_t>(OVERHEAD))
                                 ? (mtu - OVERHEAD)
                                 : 1476u;
@@ -1531,14 +1535,14 @@ static uint32_t open_sync_worker_blocking(scream_diretta::ScreamDirettaSync*& ou
         const int target_cycle = cfg.cycle_us > 0 ? cfg.cycle_us
             : (int)calculateCycleTime(g_st.sample_rate, g_st.channels,
                                       g_st.bits_per_sample, eff_mtu);
-        const long long actual_cycle = (long long)(sync->getCycleTime().getMicroSeconds());
-        DLOG(2, "transfer: mtu=%u mode=%s target_cycle=%dus actual_cycle=%lldus "
+        const long long sdk_cycle = (long long)(sync->getCycleTime().getMicroSeconds());
+        DLOG(2, "transfer: mtu=%u mode=%s target_cycle=%dus sdk_cycle=%lldus "
              "cycle_size=%zuB cycle_packets=%zu",
-             (unsigned)eff_mtu, applied_mode, target_cycle, actual_cycle,
+             (unsigned)eff_mtu, applied_mode, target_cycle, sdk_cycle,
              (size_t)sync->getCycleSize(),
              (size_t)sync->getCyclePackets());
         g_st.target_cycle_us = static_cast<uint64_t>(target_cycle);
-        g_st.actual_cycle_us = static_cast<uint64_t>(actual_cycle);
+        g_st.sdk_cycle_us = static_cast<uint64_t>(sdk_cycle);
     }
     dbg_event("setConfigTransfer_return", "");
 
@@ -2376,7 +2380,6 @@ static void format_stats_line(const char* tag, char* out, size_t outlen) {
         "[diretta] %s: pushed=%llu B / %llu fr | dropped=%llu B / %llu fr / %llu ms"
         " | partial_carry=%llu | fmt_changes=%llu | underruns=%llu (events=%llu)"
         " | fill=%llu/%llu B (~%llu ms) | cycles real=%llu silent=%llu"
-        " | target_cycle=%lluus actual_cycle=%lluus"
         " | push_delta_ms=%lld drain_delta_ms=%lld net_fill_delta_ms=%lld "
         "fill_delta_ms=%lld%s",
         tag,
@@ -2394,8 +2397,6 @@ static void format_stats_line(const char* tag, char* out, size_t outlen) {
         (unsigned long long)s.ring_fill_ms,
         (unsigned long long)s.real_cycles,
         (unsigned long long)s.silent_cycles,
-        (unsigned long long)s.target_cycle_us,
-        (unsigned long long)s.actual_cycle_us,
         push_delta_ms, drain_delta_ms, net_fill_delta_ms, fill_delta_ms,
         s.dsd_active ? " | dsd" : "");
 
@@ -3649,7 +3650,7 @@ extern "C" int diretta_get_stats(diretta_stats_t *out) {
         out->popped_bytes    = g_st.sync->poppedBytes();
     }
     out->target_cycle_us = g_st.target_cycle_us;
-    out->actual_cycle_us = g_st.actual_cycle_us;
+    out->sdk_cycle_us    = g_st.sdk_cycle_us;
     out->dsd_active     = g_st.is_dsd ? 1 : 0;
     out->dsd_multiplier = g_st.is_dsd ? g_st.dsd_multiplier : 0;
     out->dsd_real_rate  = g_st.is_dsd ? g_st.dsd_real_rate : 0;
