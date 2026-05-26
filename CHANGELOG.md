@@ -123,6 +123,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - Control / async threads are never elevated.
   (`diretta.h`, `diretta.cpp`, `diretta_sync.h`, `diretta_sync.cpp`, `scream.c`)
 
+- **Add `nice(-10)` to async worker threads**.
+  The async open worker and the bounded-disconnect cleanup worker both run
+  on the CFS scheduler (not SCHED_FIFO). Setting nice to -10 gives them
+  priority over ordinary background tasks without starving the audio
+  hot-path threads that use `SCHED_FIFO`.
+  (`diretta.cpp`)
+
 - **Persist inferred protocol overhead across restarts**.
   On the first successful SDK open, s2d infers the actual overhead from
   `eff_mtu - getCycleSize()` and caches it to

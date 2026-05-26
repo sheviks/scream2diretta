@@ -1928,6 +1928,9 @@ static bool start_async_sync_open(const FormatConfigure& fc, const char* reason)
     g_st.async_open_state.store(AOS_InProgress, std::memory_order_release);
     g_st.async_open_accepted_bits.store(0, std::memory_order_relaxed);
     g_st.async_open_thread = std::thread([fc]() {
+#if defined(__linux__)
+        ::nice(-10);
+#endif
         scream_diretta::ScreamDirettaSync* sync_local = nullptr;
         const uint32_t accepted_bits = open_sync_worker_blocking(sync_local, fc);
         if (accepted_bits != 0) {
@@ -1969,6 +1972,9 @@ static bool bounded_disconnect(scream_diretta::ScreamDirettaSync* s,
     if (!s) return true;
     std::atomic<bool> done{false};
     std::thread t([s, &done]() {
+#if defined(__linux__)
+        ::nice(-10);
+#endif
         s->disconnect(true);
         done.store(true, std::memory_order_release);
     });
