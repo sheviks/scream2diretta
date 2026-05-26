@@ -78,10 +78,26 @@ if (SNDIO_ENABLE)
   find_package(PkgConfig)
   pkg_check_modules(PC_SNDIO sndio)
   if (PC_SNDIO_FOUND)
-    include_directories(${PC_SNDIO_INCLUDEDIR})
-    target_link_directories(${PROJECT_NAME} PUBLIC ${PC_SNDIO_LIBRARY_DIRS})
-    target_link_libraries(${PROJECT_NAME} ${PC_SNDIO_LIBRARIES})
-    target_sources(${PROJECT_NAME} PRIVATE src/sndio.c)
+    include(CheckCSourceCompiles)
+    set(CMAKE_REQUIRED_INCLUDES ${PC_SNDIO_INCLUDEDIR})
+    check_c_source_compiles("
+      #include <sndio.h>
+      int main(void) {
+        struct sio_par p;
+        struct sio_hdl *h = sio_open(SIO_DEVANY, SIO_PLAY, 0);
+        (void)h; (void)p;
+        return 0;
+      }
+    " SNDIO_USABLE)
+    if (SNDIO_USABLE)
+      include_directories(${PC_SNDIO_INCLUDEDIR})
+      target_link_directories(${PROJECT_NAME} PUBLIC ${PC_SNDIO_LIBRARY_DIRS})
+      target_link_libraries(${PROJECT_NAME} ${PC_SNDIO_LIBRARIES})
+      target_sources(${PROJECT_NAME} PRIVATE src/sndio.c)
+    else ()
+      message(WARNING "sndio headers found but unusable (incomplete); disabling sndio support")
+      set(SNDIO_ENABLE OFF)
+    endif ()
   else ()
     set(SNDIO_ENABLE OFF)
   endif ()
