@@ -441,10 +441,14 @@ static void phase_event(const char* event, const char* fmt, ...) {
             now - g_st.dbg_anchor).count();
     }
     char details[384];
-    va_list ap;
-    va_start(ap, fmt);
-    std::vsnprintf(details, sizeof(details), fmt ? fmt : "", ap);
-    va_end(ap);
+    if (fmt) {
+        va_list ap;
+        va_start(ap, fmt);
+        std::vsnprintf(details, sizeof(details), fmt, ap);
+        va_end(ap);
+    } else {
+        details[0] = '\0';
+    }
     if (rel_open_ms >= 0) {
         std::fprintf(stderr,
             "[diretta-phase] +%lldms (+%lldms since open_begin) %s%s%s\n",
@@ -475,10 +479,14 @@ static void dbg_event(const char* event, const char* fmt, ...) {
             now - g_st.dbg_open_anchor).count();
     }
     char details[512];
-    va_list ap;
-    va_start(ap, fmt);
-    std::vsnprintf(details, sizeof(details), fmt ? fmt : "", ap);
-    va_end(ap);
+    if (fmt) {
+        va_list ap;
+        va_start(ap, fmt);
+        std::vsnprintf(details, sizeof(details), fmt, ap);
+        va_end(ap);
+    } else {
+        details[0] = '\0';
+    }
     if (rel_open_ms >= 0) {
         std::fprintf(stderr,
             "[diretta-debug] +%lldms (+%lldms since open_begin) %s%s%s\n",
