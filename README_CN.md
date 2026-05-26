@@ -1,6 +1,6 @@
 # scream2diretta
 
-**v0.1** · 原生 **Scream UDP → Diretta SDK** 桥接器，适用于 Linux (aarch64, x86-64)。
+**v0.2** · 原生 **Scream UDP → Diretta SDK** 桥接器，适用于 Linux (aarch64, x86-64)。
 
 通过网络 UDP 接收来自远程机器（运行 ASIOScream / ScreamDriver / scream-alsa）的连续无压缩 PCM 流，并直接通过 Diretta Host SDK 转发到支持 Diretta 的 DAC —— **无需 ALSA、FFmpeg、UPnP 或任何中间软件层**。
 

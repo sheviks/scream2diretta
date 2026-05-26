@@ -109,6 +109,66 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.2.0] - 2026-05-26
+
+### Added
+
+- **Add `--rt-priority <1-99>` CLI parameter** for SCHED_FIFO real-time
+  scheduling on the audio hot path.
+  - Receiver thread (main thread): applies SCHED_FIFO before entering the
+    receive loop via `diretta_apply_rt_priority()`.
+  - Diretta SDK worker thread: applies SCHED_FIFO inside
+    `ScreamDirettaSync::getNewStream()` on its first call, so the priority
+    is set on the actual SDK pull thread.
+  - Control / async threads are never elevated.
+  (`diretta.h`, `diretta.cpp`, `diretta_sync.h`, `diretta_sync.cpp`, `scream.c`)
+
+- **Persist inferred protocol overhead across restarts**.
+  On the first successful SDK open, s2d infers the actual overhead from
+  `eff_mtu - getCycleSize()` and caches it to
+  `~/.config/scream2diretta/overhead-<sanitized-ip>.txt`.
+  On subsequent startups the cached value is loaded automatically,
+  eliminating the initial VarMax double-packet cycle.
+  (`diretta.cpp`)
+
+- **Auto-detect Clang + lld in `install.sh`**.
+  If `clang`, `clang++`, and `ld.lld` are all present, the installer
+  automatically configures CMake to use the Clang toolchain with lld
+  linker (matching AudioLinux's native toolchain). Falls back to the
+  system default compiler (GCC) when Clang is unavailable.
+  (`scripts/install.sh`)
+
+### Fixed
+
+- **Fix `install.sh` for root-only systems** (e.g. GentooPlayer).
+  Add `run_privileged()` helper that runs commands directly when already
+  root, falls back to `sudo`, and errors if neither is available.
+  (`scripts/install.sh`)
+
+- **Fix build failure on systems with libpcap**.
+  Rename local `pcap.c`/`pcap.h` to `pcap_input.c`/`pcap_input.h` to avoid
+  an include-guard collision with the system libpcap header (`#define PCAP_H`).
+  Also fix a missing `return 0` in `init_pcap()`.
+  (`CMakeLists.txt`, `src/pcap_input.c`, `src/pcap_input.h`, `src/scream.c`)
+
+- **Rename `actual_cycle` to `sdk_cycle`** for clarity.
+  The value returned by `getCycleTime()` is the SDK-generated transmission
+  interval at open time, not a real-time target measurement.
+  (`diretta.cpp`, `diretta.h`)
+
+- **Adjust `OVERHEAD` based on MTU**.
+  Standard frames (MTU ≤ 2000): overhead = 6B default.
+  Jumbo frames (MTU > 2000): overhead = 6B (observed 9014 → 9008).
+  The exact value is now inferred from SDK feedback on first open.
+  (`diretta.cpp`)
+
+- **Remove `target_cycle` and `sdk_cycle` from periodic stats**.
+  These values are fixed at open time and do not change during steady-state
+  playback; they are still logged once at open time.
+  (`diretta.cpp`)
+
+---
+
 ## [0.1.0] - 2026-05-20
 
 ### Summary

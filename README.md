@@ -1,6 +1,6 @@
 # scream2diretta
 
-**v0.1** · A native **Scream UDP → Diretta SDK** bridge for Linux (aarch64, x86-64).
+**v0.2** · A native **Scream UDP → Diretta SDK** bridge for Linux (aarch64, x86-64).
 
 Receives a continuous uncompressed PCM stream from a remote machine running ASIOScream / ScreamDriver / scream-alsa over UDP, and forwards it directly to a Diretta-capable DAC via the Diretta Host SDK — **without ALSA, FFmpeg, UPnP, or any intermediate software layer**.
 
@@ -240,8 +240,9 @@ sudo ./scream2diretta -t 1 -p 4011 \
 | `--rebuffer-percent <pct>` | 50 | Resume threshold after underrun |
 | `--udp-rcvbuf-bytes <bytes>` | 4194304 | Kernel SO_RCVBUF |
 | `--cpu-scream <core>` | — | Pin receiver thread to core |
-| `--cpu-audio <core>` | — | Pin SDK worker thread to core |
+| `--cpu-audio <core>` | — | Pin SDK worker thread to core (adds OCCUPIED) |
 | `--cpu-other <core>` | — | Pin helper threads to core |
+| `--rt-priority <1-99>` | — | SCHED_FIFO priority for receiver & SDK worker |
 | `--stats --stats-interval <sec>` | off | Periodic stats |
 | `-v` / `-vv` | off | Verbose / very verbose |
 
@@ -258,7 +259,12 @@ sudo ./scream2diretta -t 1 -p 4011 \
    --cpu-scream 2 --cpu-audio 3 --cpu-other 1
    ```
 
-3. **Use jumbo frames** if your network supports it (MTU 9000) for lower packet overhead.
+3. **Use real-time priority** (`SCHED_FIFO`) for the audio threads:
+   ```bash
+   --rt-priority 80
+   ```
+
+4. **Use jumbo frames** if your network supports it (MTU 9000) for lower packet overhead.
 
 ---
 
