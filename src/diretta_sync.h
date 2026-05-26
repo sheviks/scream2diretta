@@ -87,6 +87,10 @@ public:
     // makes getNewStream() emit silence forever.
     void attachRing(PcmRing* ring) { m_ring = ring; }
 
+    // Real-time priority for the SDK worker thread (getNewStream caller).
+    // Applied once on the first call into getNewStream(). -1 = disabled.
+    void setRtPriority(int p) { m_rtPriority.store(p, std::memory_order_relaxed); }
+
     // Lifecycle gate. activate() is called once the Sync is fully open and
     // ready for the SDK send thread to pull. deactivate() is called before
     // tearing the Sync down so getNewStream() can no longer touch the ring
@@ -185,6 +189,12 @@ private:
     // down or resizes the ring, so getNewStream() cannot touch m_ring
     // while it is being reallocated.
     std::atomic<bool> m_active{false};
+
+    // Real-time priority state. Set by the owner (DirettaState) before the
+    // SDK send thread starts pulling. Applied exactly once inside
+    // getNewStream() on the first call so it runs on the SDK worker thread.
+    std::atomic<int>  m_rtPriority{-1};
+    std::atomic<bool> m_rtPriorityApplied{false};
 
     //  egress PCM dumper. Owned by DirettaState in diretta.cpp; the
     // Sync just calls pcm_dumper_write() from getNewStream() when the cycle

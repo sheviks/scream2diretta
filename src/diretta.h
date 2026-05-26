@@ -226,6 +226,11 @@ typedef struct diretta_config_s {
      * Passed to Sync::open(..., cpuOther, rngOther). -1 = disabled. */
     int cpu_other;
 
+    /* Real-time priority for the Scream receiver thread and the Diretta
+     * SDK worker thread. SCHED_FIFO is applied when >= 1 (range 1..99).
+     * -1 = disabled (default). Other / control threads are never elevated. */
+    int rt_priority;
+
     /*  SO_RCVBUF size requested on the UDP receive socket, in bytes.
      * 0 = leave kernel default. main() defaults to 4 MiB whenever
      * the output backend is Diretta. Reported here for the stats banner
@@ -283,6 +288,12 @@ void diretta_config_init(diretta_config_t *cfg);
  * core < 0 is a no-op. Returns 0 on success, -1 on failure (logged to stderr).
  * Linux only; silently returns 0 on other platforms. */
 int diretta_apply_cpu_affinity(int core);
+
+/* Apply SCHED_FIFO real-time priority to the calling thread.
+ * priority must be in the range 1..99 (higher = more urgent).
+ * Linux only; silently returns 0 on other platforms.
+ * Returns 0 on success, -1 on failure (logged to stderr). */
+int diretta_apply_rt_priority(int priority);
 
 /* Discover targets and print a numbered list to stdout, then return. Returns
  * 0 on success (even if no sinks are found -- it just prints "no targets"),

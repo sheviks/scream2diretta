@@ -152,6 +152,8 @@ static void show_usage(const char *arg0)
   fprintf(stderr, "  --cpu-audio <core>           Pin the Diretta SDK main audio thread to <core>.\n");
   fprintf(stderr, "                               Automatically adds OCCUPIED to --thread-mode.\n");
   fprintf(stderr, "  --cpu-other <core>           Pin Diretta SDK helper threads to <core>.\n");
+  fprintf(stderr, "  --rt-priority <1-99>         SCHED_FIFO real-time priority for the receiver\n");
+  fprintf(stderr, "                               and Diretta SDK worker threads. -1=disabled (default).\n");
   fprintf(stderr, "\n");
   fprintf(stderr, "Stats:\n");
   fprintf(stderr, "  --stats-interval <sec>       Periodic producer-side stats every <sec> seconds (default 0=off).\n");
@@ -267,6 +269,7 @@ enum {
   OPT_CPU_SCREAM,
   OPT_CPU_AUDIO,
   OPT_CPU_OTHER,
+  OPT_RT_PRIORITY,
   OPT_VERSION,
 };
 
@@ -321,6 +324,7 @@ static const struct option long_options[] = {
   { "cpu-scream",                required_argument, 0, OPT_CPU_SCREAM },
   { "cpu-audio",                 required_argument, 0, OPT_CPU_AUDIO },
   { "cpu-other",                 required_argument, 0, OPT_CPU_OTHER },
+  { "rt-priority",               required_argument, 0, OPT_RT_PRIORITY },
   { 0, 0, 0, 0 }
 };
 
@@ -623,6 +627,15 @@ int main(int argc, char*argv[]) {
         return 1;
       }
       dcfg.cpu_other = v;
+      break;
+    }
+    case OPT_RT_PRIORITY: {
+      int v = atoi(optarg);
+      if (v != -1 && (v < 1 || v > 99)) {
+        fprintf(stderr, "--rt-priority must be -1 (disabled) or 1..99\n");
+        return 1;
+      }
+      dcfg.rt_priority = v;
       break;
     }
     case OPT_REBUFFER_PERCENT: {
@@ -1034,6 +1047,9 @@ int main(int argc, char*argv[]) {
 #if DIRETTA_ENABLE
   if (dcfg.cpu_scream >= 0) {
     diretta_apply_cpu_affinity(dcfg.cpu_scream);
+  }
+  if (dcfg.rt_priority >= 1) {
+    diretta_apply_rt_priority(dcfg.rt_priority);
   }
 #endif
 

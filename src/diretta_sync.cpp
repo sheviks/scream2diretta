@@ -11,6 +11,12 @@
 
 #include <algorithm>
 #include <cstring>
+#include <iostream>
+
+#if defined(__linux__)
+#include <pthread.h>
+#include <sched.h>
+#endif
 
 namespace scream_diretta {
 
@@ -176,6 +182,27 @@ bool ScreamDirettaSync::getNewStream(diretta_stream& s) {
             s.Size = 0;
         }
         return true;
+    }
+
+    // Apply SCHED_FIFO once on the first real call, running on the SDK
+    // worker thread so the priority affects the actual audio pull path.
+    if (!m_rtPriorityApplied.load(std::memory_order_acquire)) {
+        const int prio = m_rtPriority.load(std::memory_order_relaxed);
+        if (prio >= 1) {
+#if defined(__linux__)
+            struct sched_param param;
+            param.sched_priority = prio;
+            if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &param) == 0) {
+                std::cout << "[diretta] SDK worker set to SCHED_FIFO priority "
+                          << prio << std::endl;
+            } else {
+                std::cerr << "[diretta] WARNING: Failed to set SDK worker "
+                          << "SCHED_FIFO priority " << prio
+                          << " (errno=" << errno << ")" << std::endl;
+            }
+#endif
+        }
+        m_rtPriorityApplied.store(true, std::memory_order_release);
     }
 
     if (want == 0 || !m_ring) {

@@ -1366,6 +1366,7 @@ static uint32_t open_sync_worker_blocking(scream_diretta::ScreamDirettaSync*& ou
     const diretta_config_t& cfg = g_st.cfg;
     auto* sync = new scream_diretta::ScreamDirettaSync();
     out_sync = nullptr;
+    sync->setRtPriority(cfg.rt_priority);
 
     // Attach the persistent queue BEFORE configureFormat / connect so the
     // SDK send thread can never see a null ring.
@@ -2600,6 +2601,24 @@ extern "C" int diretta_apply_cpu_affinity(int core) {
 #endif
 }
 
+extern "C" int diretta_apply_rt_priority(int priority) {
+    if (priority < 1) return 0;
+#if defined(__linux__)
+    struct sched_param param;
+    param.sched_priority = priority;
+    if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &param) != 0) {
+        std::cerr << "[diretta] WARNING: Failed to set SCHED_FIFO priority "
+                  << priority << " (errno=" << errno << ")" << std::endl;
+        return -1;
+    }
+    std::cout << "[diretta] Thread set to SCHED_FIFO priority " << priority << std::endl;
+    return 0;
+#else
+    (void)priority;
+    return 0;
+#endif
+}
+
 extern "C" void diretta_config_init(diretta_config_t *cfg) {
     if (!cfg) return;
     std::memset(cfg, 0, sizeof(*cfg));
@@ -2651,6 +2670,8 @@ extern "C" void diretta_config_init(diretta_config_t *cfg) {
     cfg->cpu_scream = -1;
     cfg->cpu_audio  = -1;
     cfg->cpu_other  = -1;
+    // Real-time priority: -1 = disabled (default). SCHED_FIFO when 1..99.
+    cfg->rt_priority = -1;
     // Compatibility knobs. Kept so the CLI parses old scripts
     // without error; ignored by the unified-queue path.
     cfg->stats_interval_sec = 0;
