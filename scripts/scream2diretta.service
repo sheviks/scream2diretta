@@ -8,7 +8,8 @@ Type=simple
 ExecStart=/usr/local/bin/scream2diretta -t ${TARGET} -p ${PORT} ${SCREAM2DIRETTA_OPTS}
 EnvironmentFile=-/etc/default/scream2diretta
 
-# Needs root for raw network access (Diretta protocol)
+# Needs root for raw network access (Diretta protocol).
+# AmbientCapabilities prepares for future non-root migration.
 User=root
 
 # Restart on failure (not on clean stop)
@@ -19,6 +20,14 @@ RestartSec=5
 LimitRTPRIO=99
 LimitMEMLOCK=infinity
 LimitNICE=-20
+
+# Capabilities required when running as non-root:
+#   NET_RAW  - Diretta raw Ethernet frames
+#   NET_ADMIN - network interface operations
+#   SYS_NICE  - SCHED_FIFO and nice(-10)
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN CAP_SYS_NICE
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN CAP_SYS_NICE
+NoNewPrivileges=yes
 
 # Logging to journal
 StandardOutput=journal

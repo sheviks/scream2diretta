@@ -15,6 +15,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   layer, mitigating remote format-change DoS by forged UDP packets.
   (`network.h`, `network.c`, `scream.c`)
 
+- **Add Linux capabilities to systemd service**.
+  `scream2diretta.service` now declares `AmbientCapabilities` and
+  `CapabilityBoundingSet` for `CAP_NET_RAW`, `CAP_NET_ADMIN`, and
+  `CAP_SYS_NICE`, plus `NoNewPrivileges=yes`.  This limits the process
+  surface while keeping `User=root` for compatibility, and prepares the
+  ground for a future non-root service user.
+  (`scripts/scream2diretta.service`)
+
 ### Fixed
 
 - **F1**: Fix PcmRing resize race between receiver thread and Diretta SDK
