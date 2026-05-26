@@ -180,7 +180,46 @@ check_diretta_sdk() {
     exit 1
 }
 
+# Detect whether the system has a usable Clang + lld toolchain.
+# Sets USE_CLANG=1 if both clang and ld.lld are available, 0 otherwise.
+detect_compiler() {
+    if command -v clang >/dev/null 2>&1 && command -v clang++ >/dev/null 2>&1; then
+        if command -v ld.lld >/dev/null 2>&1 || command -v lld >/dev/null 2>&1; then
+            USE_CLANG=1
+            return
+        fi
+    fi
+    USE_CLANG=0
+}
+
 build_scream2diretta() {
+    print_header "Building scream2diretta"
+    detect_compiler
+    cd "$SCRIPT_DIR"
+    if [ -d "build" ]; then
+        print_info "Cleaning previous build..."
+        rm -rf build
+    fi
+    mkdir -p build
+    export DIRETTA_SDK_PATH="$(realpath "$SDK_PATH")"
+    cd build
+    print_info "Configuring with CMake..."
+    local cmake_args="-DDIRETTA_ENABLE=ON -DDIRETTA_SDK_ROOT=$DIRETTA_SDK_PATH"
+    if [ -n "$ARCH_NAME" ]; then
+        print_info "Using DIRETTA_ARCH_SUFFIX=$ARCH_NAME"
+        cmake_args="$cmake_args -DDIRETTA_ARCH_SUFFIX=$ARCH_NAME"
+    fi
+    if [ "$USE_CLANG" -eq 1 ]; then
+        print_info "Clang + lld detected; using Clang toolchain with LTO"
+        export CC=clang
+        export CXX=clang++
+        export LDFLAGS="${LDFLAGS} -fuse-ld=lld"
+        cmake_args="$cmake_args -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++"
+        cmake_args="$cmake_args -DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld"
+    else
+        print_info "Using system default compiler (GCC or toolchain default)"
+    fi
+    cmake $cmake_args ..
     print_header "Building scream2diretta"
     cd "$SCRIPT_DIR"
     if [ -d "build" ]; then
