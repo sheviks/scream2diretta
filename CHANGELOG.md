@@ -78,6 +78,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **Change default `--stats-interval` from 0 to 5 seconds**.
+  When `--stats` or `-v`/`-vv` is active, periodic stats now print every
+  5 seconds by default instead of being disabled (interval 0 previously
+  prevented any periodic output).  The old `--stats-interval 1` behaviour
+  was too noisy for steady-state monitoring; 5s is a better balance.
+  (`diretta.cpp`)
+
 - **Remove `--target-buffer-ms` and `-B` from CLI; default to SDK default**.
   The `target_buffer_ms` field remains in `diretta_config_t` (default 0) and
   is still passed to `Sync::setSink()`, but there is no longer a CLI option.

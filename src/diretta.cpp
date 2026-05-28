@@ -2688,7 +2688,7 @@ extern "C" void diretta_config_init(diretta_config_t *cfg) {
     cfg->rt_priority = -1;
     // Compatibility knobs. Kept so the CLI parses old scripts
     // without error; ignored by the unified-queue path.
-    cfg->stats_interval_sec = 0;
+    cfg->stats_interval_sec = 5;
     cfg->stats_enabled = 0;
     cfg->log_level = DIRETTA_LOG_DEFAULT;
     // Compatibility packet capacity. The current hot path uses PcmRing.
