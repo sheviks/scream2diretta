@@ -220,22 +220,6 @@ build_scream2diretta() {
         print_info "Using system default compiler (GCC or toolchain default)"
     fi
     cmake $cmake_args ..
-    print_header "Building scream2diretta"
-    cd "$SCRIPT_DIR"
-    if [ -d "build" ]; then
-        print_info "Cleaning previous build..."
-        rm -rf build
-    fi
-    mkdir -p build
-    export DIRETTA_SDK_PATH="$(realpath "$SDK_PATH")"
-    cd build
-    print_info "Configuring with CMake..."
-    local cmake_args="-DDIRETTA_ENABLE=ON -DDIRETTA_SDK_ROOT=$DIRETTA_SDK_PATH"
-    if [ -n "$ARCH_NAME" ]; then
-        print_info "Using DIRETTA_ARCH_SUFFIX=$ARCH_NAME"
-        cmake_args="$cmake_args -DDIRETTA_ARCH_SUFFIX=$ARCH_NAME"
-    fi
-    cmake $cmake_args ..
     print_info "Building..."
     make -j$(nproc)
     if [ -f "scream2diretta" ]; then
