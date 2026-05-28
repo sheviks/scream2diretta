@@ -5,7 +5,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/scream2diretta -t ${TARGET} -p ${PORT} ${SCREAM2DIRETTA_OPTS}
+# systemd does not perform shell word-splitting on ${SCREAM2DIRETTA_OPTS},
+# so the entire value would be passed as a single argument.  Run through
+# /bin/sh so that spaces inside the variable are split correctly.
+ExecStart=/bin/sh -c 'exec /usr/local/bin/scream2diretta -t "${TARGET}" -p "${PORT}" ${SCREAM2DIRETTA_OPTS}'
 EnvironmentFile=-/etc/default/scream2diretta
 
 # Needs root for raw network access (Diretta protocol).
