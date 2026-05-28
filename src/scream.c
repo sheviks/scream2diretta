@@ -329,6 +329,17 @@ static const struct option long_options[] = {
 };
 
 int main(int argc, char*argv[]) {
+  /* systemd multi-line ExecStart expands undefined env vars to empty
+   * strings, e.g. ${VERBOSE} when VERBOSE is commented out.  Strip
+   * them so getopt does not receive stray "" tokens. */
+  int j = 1;
+  for (int i = 1; i < argc; ++i) {
+    if (argv[i] && argv[i][0] != '\0') {
+      argv[j++] = argv[i];
+    }
+  }
+  argc = j;
+
   int res;
 
   void (*receiver_rcv_fn)(receiver_data_t* receiver_data);
