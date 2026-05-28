@@ -23,6 +23,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   ground for a future non-root service user.
   (`scripts/scream2diretta.service`)
 
+- **Redirect service logs to `/var/log/scream2diretta.log`**.
+  `StandardOutput` and `StandardError` now use `append:` so verbose
+  output (enabled with `-vv` in `SCREAM2DIRETTA_OPTS`) is written to a
+  dedicated file instead of the systemd journal.  A logrotate config is
+  installed automatically by `install.sh` to keep the file from growing
+  unbounded during extended debug sessions.
+  (`scripts/scream2diretta.service`, `scripts/scream2diretta.logrotate`,
+  `scripts/install.sh`)
+
+- **Fix `SCREAM2DIRETTA_OPTS` word-splitting in systemd**.
+  `ExecStart` now runs through `/bin/sh -c` so spaces inside the
+  environment variable are split correctly.  Previously the entire value
+  was passed as a single argument, causing "Too long interface name"
+  when `-i` was followed by additional flags.
+  (`scripts/scream2diretta.service`)
+
 ### Fixed
 
 - **F1**: Fix PcmRing resize race between receiver thread and Diretta SDK

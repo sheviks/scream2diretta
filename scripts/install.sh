@@ -285,6 +285,11 @@ setup_systemd_service() {
             print_info "Configuration file is up to date"
         fi
     fi
+    if [ -d /etc/logrotate.d ]; then
+        print_info "Installing logrotate configuration..."
+        run_privileged cp "$SCRIPT_DIR/scripts/scream2diretta.logrotate" /etc/logrotate.d/scream2diretta
+        print_success "Logrotate config installed: /etc/logrotate.d/scream2diretta"
+    fi
     print_info "Reloading systemd daemon..."
     run_privileged systemctl daemon-reload
     echo ""
@@ -301,22 +306,6 @@ setup_systemd_service() {
     fi
     echo ""
     print_success "Installation complete!"
-    echo ""
-    echo "  Binary:        $INSTALL_BIN/scream2diretta"
-    echo "  Configuration: $CONFIG_FILE"
-    echo ""
-    echo "  Next steps:"
-    echo "    1. Edit configuration (optional):"
-    echo "       sudo nano $CONFIG_FILE"
-    echo ""
-    echo "    2. Start the service:"
-    echo "       sudo systemctl start scream2diretta"
-    echo ""
-    echo "    3. Check status:"
-    echo "       sudo systemctl status scream2diretta"
-    echo ""
-    echo "    4. View logs:"
-    echo "       sudo journalctl -u scream2diretta -f"
     echo ""
 }
 

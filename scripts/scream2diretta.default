@@ -18,5 +18,11 @@ PORT=4011
 # For best sound quality, also consider:
 #   --cpu-scream 2 --cpu-audio 3 --cpu-other 1
 #
-# Default: conservative settings (no CPU affinity)
+# Verbose / debug (logs go to /var/log/scream2diretta.log):
+#   -vv                    : verbose output
+#   --stats                : enable periodic stats
+#   --stats-interval 1     : stats every 1 second
+#   --diretta-debug        : SDK-level debug
+#
+# Default: conservative settings (no CPU affinity, no verbose logging)
 SCREAM2DIRETTA_OPTS="--pcm-buffer-ms 1000 --pcm-prefill-ms 500 --rebuffer-percent 50"

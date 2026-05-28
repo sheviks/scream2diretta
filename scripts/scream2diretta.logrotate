@@ -1,0 +1,11 @@
+# Logrotate configuration for scream2diretta
+# Install to /etc/logrotate.d/scream2diretta
+/var/log/scream2diretta.log {
+    daily
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0644 root root
+}
