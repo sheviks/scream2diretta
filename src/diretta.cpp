@@ -143,8 +143,8 @@ struct DirettaState {
     uint32_t reconnect_backoff_ms = 500;
 
     // Format-change cooldown gives the target time to release the previous
-    // stream before accepting a new FormatConfigure. Slow SDK cleanup runs
-    // asynchronously and may be abandoned if the SDK does not return.
+    // stream before accepting a new FormatConfigure. SDK cleanup runs
+    // asynchronously off the audio thread.
     std::chrono::steady_clock::time_point reconfigure_ready_at{};
     bool reconfigure_pending = false;
 
@@ -172,11 +172,6 @@ struct DirettaState {
     uint64_t stream_count_at_open = 0;
 
     bool reconnect_pending = false;
-
-    // Count Sync objects intentionally abandoned because an SDK disconnect or
-    // cleanup call exceeded its bounded wait. They are kept alive for process
-    // lifetime because an SDK thread may still hold the pointer.
-    std::atomic<uint64_t> abandoned_sync_count{0};
 
     // Tail of the latest receive that didn't end on a frame boundary;
     // carried forward into the next push so the queue only ever sees
@@ -530,7 +525,6 @@ static inline int effective_cooldown_ms() {
 constexpr int OPEN_GATE_MAX_WAIT_MS = 3000;
 
 constexpr int RUNTIME_CLEANUP_BUDGET_MS = 1500;
-constexpr int RUNTIME_CLEANUP_POLL_MS = 25;
 
 // After connect() succeeds, suppress sink-lost detection for this window.
 constexpr int SINK_OPEN_GRACE_MS = 2000;
@@ -1443,6 +1437,10 @@ static uint32_t open_sync_worker_blocking(scream_diretta::ScreamDirettaSync*& ou
     }
     phase_event("setSink_end", "result=ok buffer_ms=%d", eff_buf_ms);
     dbg_event("setSink_return", "result=ok");
+    // Pace the handshake: target needs time between SDK calls or it
+    // misses the first cycles and produces no audio. Mirrors DRUP /
+    // slim2Diretta inter-call pauses.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
     // Format negotiation: PCM falls back to lower bit depths; DSD tries
     // the four common LSB/MSB × BIG/LITTLE combinations.
@@ -1542,6 +1540,8 @@ static uint32_t open_sync_worker_blocking(scream_diretta::ScreamDirettaSync*& ou
                       g_st.bits_per_sample, accepted_bits);
         }
     }
+    // Pace the handshake after setSinkConfigure -- DRUP sleeps 100ms here.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
     dbg_event("inquirySupportFormat_begin", "");
     sync->inquirySupportFormat(g_st.sink_addr);
@@ -1640,10 +1640,16 @@ static uint32_t open_sync_worker_blocking(scream_diretta::ScreamDirettaSync*& ou
         }
     }
     dbg_event("setConfigTransfer_return", "");
+    // Pace before connectPrepare so the target sees the new transfer
+    // configuration before the connect handshake starts.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
     dbg_event("connectPrepare_begin", "");
     sync->connectPrepare();
     dbg_event("connectPrepare_return", "");
+    // DRUP and slim2Diretta both pause between connectPrepare and
+    // connect (CONNECT_DELAY_MS in slim2Diretta; ~100ms in DRUP).
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
     // Configure per-format Sync state (cycle size, prefill threshold). The
     // ring it reads from is g_st.queue, already sized by
@@ -1721,6 +1727,24 @@ static uint32_t open_sync_worker_blocking(scream_diretta::ScreamDirettaSync*& ou
               sync->is_connect() ? 1 : 0,
               sync->is_online() ? 1 : 0,
               sync->is_active() ? 1 : 0);
+
+    // Wait for the target to actually transition to ONLINE before
+    // starting playback. slim2Diretta uses
+    //   while (!is_online()) sleep_for(5ms);
+    // We bound the wait at 500ms so a non-responsive target cannot
+    // wedge the open path. Without this poll, play() can fire before
+    // the target has finished its CONNECT transition, and the first
+    // cycles are lost (silent startup until something nudges the
+    // target -- which is what -vv accidentally provides via log I/O).
+    {
+        const auto poll_deadline = std::chrono::steady_clock::now() +
+                                   std::chrono::milliseconds(500);
+        while (!sync->is_online() &&
+               std::chrono::steady_clock::now() < poll_deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        dbg_event("online_poll_done", "is_online=%d", sync->is_online() ? 1 : 0);
+    }
 
     phase_event("play_begin", "");
     dbg_event("play_begin", "");
@@ -1964,44 +1988,25 @@ static void cleanup_finder() {
     }
 }
 
-static void abandon_sync_pointer(scream_diretta::ScreamDirettaSync* s, const char* reason) {
-    if (!s) return;
-    const uint64_t count = g_st.abandoned_sync_count.fetch_add(1, std::memory_order_relaxed) + 1;
-    std::fprintf(stderr,
-        "[diretta] abandoning Sync #%llu (%s); SDK cleanup did not finish in budget, "
-        "so the object is kept alive for process lifetime\n",
-        (unsigned long long)count, reason ? reason : "unknown");
-}
-
-// Bounded SDK disconnect with a configurable budget.
+// Deterministic SDK disconnect using the canonical DRUP / slim2Diretta
+// pattern: stop() then disconnect_flgset() then a brief 50ms pause so the
+// bare-Ethernet disconnect notice can leave on the wire before the caller
+// closes the socket. Replaces the older disconnect(true) + thread-detach +
+// abandon pattern, which could block indefinitely on a stale target
+// session and left the target waiting out an abandoned session whenever
+// the disconnect did not complete in budget.
+//
+// Always returns true; callers can drop their failure-path branches.
+// budget_ms and reason are kept for source-level ABI compatibility with
+// existing call sites; they are intentionally unused.
 static bool bounded_disconnect(scream_diretta::ScreamDirettaSync* s,
-                               int budget_ms,
-                               const char* reason) {
+                               int /*budget_ms*/,
+                               const char* /*reason*/) {
     if (!s) return true;
-    std::atomic<bool> done{false};
-    std::thread t([s, &done]() {
-#if defined(__linux__)
-        ::nice(-10);
-#endif
-        s->disconnect(true);
-        done.store(true, std::memory_order_release);
-    });
-    const auto deadline = std::chrono::steady_clock::now() +
-                          std::chrono::milliseconds(budget_ms);
-    while (!done.load(std::memory_order_acquire) &&
-           std::chrono::steady_clock::now() < deadline) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    }
-    if (done.load(std::memory_order_acquire)) {
-        t.join();
-        return true;
-    }
-    std::fprintf(stderr,
-        "[diretta] SDK disconnect did not complete within %dms (%s); "
-        "leaving disconnect thread detached and abandoning Sync\n",
-        budget_ms, reason ? reason : "shutdown");
-    t.detach();
-    return false;
+    s->stop();
+    s->disconnect_flgset();
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    return true;
 }
 
 static void teardown_sync_for_shutdown() {
@@ -2022,15 +2027,7 @@ static void teardown_sync_for_shutdown() {
 
     if (!g_st.sync) return;
     if (g_st.sink_active) {
-        bool clean = bounded_disconnect(g_st.sync, /*budget_ms*/ 750, "shutdown");
-        if (!clean) {
-            abandon_sync_pointer(g_st.sync, "shutdown disconnect timeout");
-            g_st.sync = nullptr;
-            g_st.sink_active = false;
-            g_st.bytes_per_frame = 0;
-            g_st.partial_frame_len = 0;
-            return;
-        }
+        bounded_disconnect(g_st.sync, /*budget_ms*/ 0, "shutdown");
     }
     g_st.sync->close();
     delete g_st.sync;
@@ -2055,47 +2052,27 @@ static void cleanup_sync_async(scream_diretta::ScreamDirettaSync* old,
               "reason=%s inflight=%d", reason.c_str(),
               g_inflight_cleanups.load(std::memory_order_acquire));
 
-    // stop() / disconnect(false) are non-blocking; only disconnectWait
-    // blocks, and we don't call it from the audio thread.
-    old->stop();
-    old->disconnect(false);
-
+    // Run the deterministic disconnect + close + delete on a worker
+    // thread so the audio thread is never blocked. bounded_disconnect()
+    // uses stop() + disconnect_flgset() + 50ms wait, which is bounded
+    // and never hangs on a stale target session. close() and delete are
+    // then safe to call directly because no SDK thread is mid-pull.
     std::thread t([old, reason]() {
+#if defined(__linux__)
+        ::nice(-10);
+#endif
         const auto t0 = std::chrono::steady_clock::now();
-        const auto deadline = t0 + std::chrono::milliseconds(RUNTIME_CLEANUP_BUDGET_MS);
-        bool clean = false;
-
-        while (std::chrono::steady_clock::now() < deadline) {
-            if (old->is_disconnect() && !old->is_connect()) {
-                clean = true;
-                break;
-            }
-            std::this_thread::sleep_for(
-                std::chrono::milliseconds(RUNTIME_CLEANUP_POLL_MS));
-        }
-
+        bounded_disconnect(old, 0, reason.c_str());
+        old->close();
+        delete old;
         const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count();
-
-        if (clean) {
-            old->close();
-            delete old;
-            std::fprintf(stderr,
-                "[diretta] cleanup thread completed cleanly in %lldms (%s)\n",
-                (long long)elapsed, reason.c_str());
-            dbg_event("format_change_cleanup_end",
-                      "clean=true elapsed_ms=%lld reason=%s",
-                      (long long)elapsed, reason.c_str());
-        } else {
-            std::fprintf(stderr,
-                "[diretta] cleanup thread budget exhausted after %lldms (%s); "
-                "abandoning Sync to avoid blocking\n",
-                (long long)elapsed, reason.c_str());
-            dbg_event("format_change_cleanup_end",
-                      "clean=false abandoned=true elapsed_ms=%lld reason=%s",
-                      (long long)elapsed, reason.c_str());
-            abandon_sync_pointer(old, reason.c_str());
-        }
+        std::fprintf(stderr,
+            "[diretta] cleanup thread completed in %lldms (%s)\n",
+            (long long)elapsed, reason.c_str());
+        dbg_event("format_change_cleanup_end",
+                  "elapsed_ms=%lld reason=%s",
+                  (long long)elapsed, reason.c_str());
         g_inflight_cleanups.fetch_sub(1, std::memory_order_acq_rel);
     });
     t.detach();
