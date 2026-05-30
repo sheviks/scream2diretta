@@ -32,6 +32,13 @@ AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN CAP_SYS_NICE
 CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN CAP_SYS_NICE
 NoNewPrivileges=yes
 
+# Persistent state directory for per-target overhead cache
+# (overhead-<ip>.txt). systemd creates /var/lib/scream2diretta with
+# mode 0750 owned by User=, and exports $STATE_DIRECTORY so the
+# binary can find it even when ProtectHome=true blocks /root/.config.
+StateDirectory=scream2diretta
+StateDirectoryMode=0750
+
 # Logging: append stdout/stderr to a dedicated log file instead of the
 # systemd journal.  Add -vv (or --stats) to SCREAM2DIRETTA_OPTS in
 # /etc/default/scream2diretta to enable verbose output.

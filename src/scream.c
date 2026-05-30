@@ -24,7 +24,7 @@
 #include <errno.h>
 
 #ifndef SCREAM2DIRETTA_VERSION
-#define SCREAM2DIRETTA_VERSION "0.2"
+#define SCREAM2DIRETTA_VERSION "0.3"
 #endif
 
 #if PULSEAUDIO_ENABLE

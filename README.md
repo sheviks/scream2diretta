@@ -1,6 +1,6 @@
 # scream2diretta
 
-**v0.2** · A native **Scream UDP → Diretta SDK** bridge for Linux (aarch64, x86-64).
+**v0.3** · A native **Scream UDP → Diretta SDK** bridge for Linux (aarch64, x86-64).
 
 Receives a continuous uncompressed PCM stream from a remote machine running ASIOScream / ScreamDriver / scream-alsa over UDP, and forwards it directly to a Diretta-capable DAC via the Diretta Host SDK — **without ALSA, FFmpeg, UPnP, or any intermediate software layer**.
 

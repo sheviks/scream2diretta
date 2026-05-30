@@ -8,6 +8,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+---
+
+## [0.3.0] - 2026-05-30
+
+### Summary
+
+Production-hardening release focused on the systemd deployment path and a
+class of subtle SDK lifecycle / startup-handshake bugs that caused silent
+starts and per-target overhead caching to silently fail. Also adds UDP
+source-IP validation, Linux capability bounding for the service unit,
+and dedicated log-file output with logrotate.
+
 ### Security
 
 - **F2**: Add UDP source IP validation via `--allowed-source-ip <ip>`.
@@ -27,8 +39,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `StandardOutput` and `StandardError` now use `append:` so verbose
   output (enabled with `-vv` in `SCREAM2DIRETTA_OPTS`) is written to a
   dedicated file instead of the systemd journal.  A logrotate config is
-  installed automatically by `install.sh` to keep the file from growing
-  unbounded during extended debug sessions.
+  installed automatically by `install.sh` (10M size trigger) to keep
+  the file from growing unbounded during extended debug sessions.
   (`scripts/scream2diretta.service`, `scripts/scream2diretta.logrotate`,
   `scripts/install.sh`)
 
@@ -40,6 +52,64 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (`scripts/scream2diretta.service`)
 
 ### Fixed
+
+- **R2: Close in-flight `getNewStream()` window with ring-user guard**.
+  `m_active=false` only blocked _new_ pull cycles; a cycle that had
+  already passed the gate could still be inside `m_ring` access while the
+  receiver thread reallocated the ring (UB). Mirrors DRUP's
+  `RingAccessGuard` / `beginReconfigure()` pattern: a `std::atomic<int>
+  m_ringUsers` counter is incremented under acq_rel inside `getNewStream()`
+  after passing the `m_active` check, and `deactivate()` is now two-phase
+  (set `m_active=false`, then spin until `m_ringUsers==0`). A second
+  occurrence of the same pattern in `finalize_sync_open_on_receiver()`
+  (auto-downgrade resize path) was wrapped in
+  `deactivate() → resize → configureFormat → activate()`.
+  (`diretta_sync.h`, `diretta_sync.cpp`, `diretta.cpp`)
+
+- **Silent startup under systemd**: deterministic SDK disconnect + paced
+  handshake. `bounded_disconnect()` now uses `stop() → disconnect_flgset()
+  → sleep 50ms` (deterministic, non-blocking, target-protocol-clean)
+  instead of `disconnect(true)+detach+abandon`. `open_sync_worker_blocking()`
+  now paces `setSink/setSinkConfigure/setConfigTransfer/connectPrepare`
+  with 50ms gaps and uses `is_online()` polling (5ms × 100, 500ms cap)
+  before `play()`, so the target is always online before the first cycle.
+  The abandon/detach path was deleted entirely. Previously a service
+  start often produced no audio until the user added `-vv`, because
+  fprintf I/O accidentally provided the missing pacing.
+  (`diretta.cpp`)
+
+- **Persist inferred overhead regardless of verbosity, and store it under
+  `$STATE_DIRECTORY` when running as a systemd service**.
+  Two related bugs prevented the per-target overhead cache from working in
+  production runs:
+  1. The overhead-inference + cache-write block in `open_sync_worker_blocking()`
+     was gated under `if (verbosity >= 2)`, so service runs without `-vv` never
+     populated the cache on the first successful open against a new target.
+  2. The cache directory was hard-coded to `$HOME/.config/scream2diretta`,
+     which fails under the hardened systemd unit (`ProtectHome=true` makes
+     `/root` read-only) with `mkdir(/root/.config) failed: Permission denied`.
+  Fixes:
+  - The inference + `save_inferred_overhead()` block now runs unconditionally;
+    only the verbose `transfer:` DLOG remains gated by `verbosity >= 2`.
+  - `overhead_cache_dir()` now prefers `$STATE_DIRECTORY` (exported by
+    systemd when `StateDirectory=scream2diretta` is set) and falls back to
+    `$HOME/.config/scream2diretta` for manual invocation, then `/tmp/scream2diretta`.
+  - `scream2diretta.service` now declares `StateDirectory=scream2diretta`
+    (mode 0750), so systemd auto-creates `/var/lib/scream2diretta/` and the
+    cache survives `ProtectHome=true` / `ProtectSystem=strict`.
+  - `save_inferred_overhead()` and `ensure_cache_dir()` now log the actual
+    path / errno on failure so future regressions are diagnosable from a
+    single log line.
+  (`diretta.cpp`, `scripts/scream2diretta.service`)
+
+- **Strip empty-string arguments from argv**.
+  When `SCREAM2DIRETTA_OPTS` contained empty quoted segments
+  (e.g. `"" --foo`), getopt_long() saw a zero-length argument and
+  errored out. The wrapper now compacts argv before parsing.
+  (`scream.c`)
+
+- **Remove duplicate `cmake` configure call in `install.sh`**.
+  (`scripts/install.sh`)
 
 - **F1**: Fix PcmRing resize race between receiver thread and Diretta SDK
   send thread. `ScreamDirettaSync` now carries an `m_active` atomic gate.
@@ -76,12 +146,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Cycle Time slot. `info_cycle_us` remains exclusively in `Sync::open()`.
   (`diretta.cpp`)
 
+- **Silence `-Wformat-zero-length` on clang**.
+  (`diretta.cpp`)
+
+- **Skip `sndio` backend when headers are incomplete**.
+  (`CMakeLists.txt`, `src/sndio.c`)
+
 ### Changed
+
+- **Add `nice(-10)` to async open and cleanup worker threads**.
+  Receiver and SDK pull threads use SCHED_FIFO via `--rt-priority`; the
+  blocking control-plane workers now run at `nice -10` so they preempt
+  ordinary background load without competing with the audio hot path.
+  (`diretta.cpp`)
 
 - **Change default `--stats-interval` from 0 to 5 seconds**.
   When `--stats` or `-v`/`-vv` is active, periodic stats now print every
   5 seconds by default instead of being disabled (interval 0 previously
-  prevented any periodic output).  The old `--stats-interval 1` behaviour
+  prevented any periodic output). The old `--stats-interval 1` behaviour
   was too noisy for steady-state monitoring; 5s is a better balance.
   (`diretta.cpp`)
 

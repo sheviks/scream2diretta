@@ -32,6 +32,7 @@ extern "C" {
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdarg>
 #include <cstdint>
@@ -789,9 +790,26 @@ static std::string ip_to_str(const IPAddress& a) {
 // Overhead cache helpers -----------------------------------------------------
 
 static std::string overhead_cache_dir() {
+    // Prefer $STATE_DIRECTORY when running under systemd with
+    // `StateDirectory=scream2diretta`. systemd creates /var/lib/scream2diretta
+    // and exports the path here, and the directory remains writable even
+    // when `ProtectHome=true` / `ProtectSystem=strict` are active.
+    // If multiple StateDirectory entries are configured, $STATE_DIRECTORY is
+    // colon-separated; take the first.
+    if (const char* sd = std::getenv("STATE_DIRECTORY")) {
+        if (sd[0]) {
+            std::string s(sd);
+            const auto colon = s.find(':');
+            if (colon != std::string::npos) s.resize(colon);
+            return s;
+        }
+    }
+    // Manual / non-systemd invocation: write under the user's config dir.
     const char* home = std::getenv("HOME");
-    if (!home || !home[0]) home = "/tmp";
-    return std::string(home) + "/.config/scream2diretta";
+    if (home && home[0]) {
+        return std::string(home) + "/.config/scream2diretta";
+    }
+    return "/tmp/scream2diretta";
 }
 
 static std::string overhead_cache_file(const IPAddress& addr) {
@@ -815,10 +833,16 @@ static void ensure_cache_dir() {
         if (home && home[0]) {
             std::string parent = std::string(home) + "/.config";
             if (stat(parent.c_str(), &st) != 0) {
-                mkdir(parent.c_str(), 0755);
+                if (mkdir(parent.c_str(), 0755) != 0 && errno != EEXIST) {
+                    DLOG(1, "ensure_cache_dir: mkdir(%s) failed: %s",
+                         parent.c_str(), std::strerror(errno));
+                }
             }
         }
-        mkdir(dir.c_str(), 0755);
+        if (mkdir(dir.c_str(), 0755) != 0 && errno != EEXIST) {
+            DLOG(1, "ensure_cache_dir: mkdir(%s) failed: %s",
+                 dir.c_str(), std::strerror(errno));
+        }
     }
 #endif
 }
@@ -837,7 +861,21 @@ static void save_inferred_overhead(const IPAddress& addr, int overhead) {
     ensure_cache_dir();
     const std::string path = overhead_cache_file(addr);
     std::ofstream f(path);
-    if (f) f << overhead << "\n";
+    if (f) {
+        f << overhead << "\n";
+        f.flush();
+        if (f.good()) {
+            DLOG(1, "overhead cache saved: %s = %d", path.c_str(), overhead);
+        } else {
+            DLOG(1, "overhead cache write failed: %s (errno=%s)",
+                 path.c_str(), std::strerror(errno));
+        }
+    } else {
+        const char* home = std::getenv("HOME");
+        DLOG(1, "overhead cache open failed: %s (errno=%s, HOME=%s)",
+             path.c_str(), std::strerror(errno),
+             (home && home[0]) ? home : "<unset>");
+    }
 }
 
 // Dynamic cycle-time calculation matching DRUP / slim2Diretta.
@@ -1604,7 +1642,12 @@ static uint32_t open_sync_worker_blocking(scream_diretta::ScreamDirettaSync*& ou
                   (size_t)sync->getCycleSize(),
                   (size_t)sync->getCyclePackets());
     }
-    if (verbosity >= 2) {
+    // Compute cycle stats once. The DLOG below is verbose-only, but cycle
+    // caching and overhead inference run unconditionally so a fresh service
+    // start (without -vv) still populates the overhead-*.txt cache on the
+    // first successful open. Cache location is resolved by overhead_cache_dir():
+    // $STATE_DIRECTORY (systemd) → $HOME/.config/scream2diretta → /tmp.
+    {
         const uint32_t eff_mtu = cfg.mtu_override > 0
             ? (uint32_t)cfg.mtu_override
             : g_st.mtu;
@@ -1613,11 +1656,15 @@ static uint32_t open_sync_worker_blocking(scream_diretta::ScreamDirettaSync*& ou
                                       g_st.bits_per_sample, eff_mtu,
                                       g_st.inferred_overhead);
         const long long sdk_cycle = (long long)(sync->getCycleTime().getMicroSeconds());
-        DLOG(2, "transfer: mtu=%u mode=%s target_cycle=%dus sdk_cycle=%lldus "
-             "cycle_size=%zuB cycle_packets=%zu",
-             (unsigned)eff_mtu, applied_mode, target_cycle, sdk_cycle,
-             (size_t)sync->getCycleSize(),
-             (size_t)sync->getCyclePackets());
+
+        if (verbosity >= 2) {
+            DLOG(2, "transfer: mtu=%u mode=%s target_cycle=%dus sdk_cycle=%lldus "
+                 "cycle_size=%zuB cycle_packets=%zu",
+                 (unsigned)eff_mtu, applied_mode, target_cycle, sdk_cycle,
+                 (size_t)sync->getCycleSize(),
+                 (size_t)sync->getCyclePackets());
+        }
+
         g_st.target_cycle_us = static_cast<uint64_t>(target_cycle);
         g_st.sdk_cycle_us = static_cast<uint64_t>(sdk_cycle);
 
