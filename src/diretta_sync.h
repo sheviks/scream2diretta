@@ -95,8 +95,15 @@ public:
     // ready for the SDK send thread to pull. deactivate() is called before
     // tearing the Sync down so getNewStream() can no longer touch the ring
     // (which may be resized / destroyed by the receiver thread).
+    //
+    // deactivate() is two-phase: it sets m_active=false AND then spins
+    // until any in-flight getNewStream() cycle that already passed the
+    // first m_active check has exited the guarded section. Without that
+    // wait, an SDK pull cycle could still be inside m_ring access while
+    // the owner reallocates the ring buffer (UB). Pattern mirrors DRUP's
+    // beginReconfigure() / RingAccessGuard.
     void activate()   { m_active.store(true,  std::memory_order_release); }
-    void deactivate() { m_active.store(false, std::memory_order_release); }
+    void deactivate();
 
     //  attach the egress PCM dumper. The Sync writes the bytes returned
     // to the SDK (real-PCM cycles only, after gates pass) to this dumper.
@@ -189,6 +196,14 @@ private:
     // down or resizes the ring, so getNewStream() cannot touch m_ring
     // while it is being reallocated.
     std::atomic<bool> m_active{false};
+
+    // In-flight getNewStream() cycle counter. Incremented inside
+    // getNewStream() AFTER passing the m_active check, decremented when
+    // the cycle exits. deactivate() spins on this until it reaches 0
+    // before returning, so the owner is guaranteed no SDK pull cycle is
+    // still inside m_ring access. Mirrors DRUP's m_ringUsers /
+    // RingAccessGuard pattern.
+    std::atomic<int> m_ringUsers{0};
 
     // Real-time priority state. Set by the owner (DirettaState) before the
     // SDK send thread starts pulling. Applied exactly once inside

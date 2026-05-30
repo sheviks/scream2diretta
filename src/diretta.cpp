@@ -1779,7 +1779,13 @@ static void finalize_sync_open_on_receiver(scream_diretta::ScreamDirettaSync* sy
     // any data already pushed was in the source format. Also reconfigure
     // the Sync's internal format scalars (cycle size, prefill gates) so
     // getNewStream() uses the negotiated frame size.
+    //
+    // The Sync was already activated by open_sync_worker_blocking() so
+    // the SDK send thread may already be inside getNewStream() touching
+    // the ring. Deactivate it (which waits for any in-flight cycle to
+    // exit) before resizing, then reactivate after configureFormat().
     if (accepted_bits != source_bits) {
+        sync->deactivate();
         g_st.bits_per_sample = accepted_bits;
         g_st.bytes_per_frame = (accepted_bits / 8) * g_st.channels;
         g_st.queue_bpf = g_st.bytes_per_frame;
@@ -1824,6 +1830,10 @@ static void finalize_sync_open_on_receiver(scream_diretta::ScreamDirettaSync* sy
         tuning.startup_mute_ms  = mute_ms;
         tuning.startup_real_delay_ms = real_delay_ms;
         sync->configureFormat(g_st.sample_rate, g_st.channels, accepted_bits / 8, tuning);
+        // Reactivate now that the ring has been resized and the Sync's
+        // per-format scalars are back in sync. From here the SDK send
+        // thread may resume real getNewStream() cycles.
+        sync->activate();
     } else {
         g_st.conversion_needed = false;
     }

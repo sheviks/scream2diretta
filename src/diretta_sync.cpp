@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cstring>
 #include <iostream>
+#include <thread>
 
 #if defined(__linux__)
 #include <pthread.h>
@@ -20,8 +21,69 @@
 
 namespace scream_diretta {
 
+namespace {
+// RAII guard that pairs with ScreamDirettaSync::deactivate(). Mirrors
+// DRUP's RingAccessGuard / beginReconfigure pattern: increments the
+// ring-user counter only after observing m_active==true, then re-checks
+// to close the race window where deactivate() flipped m_active=false
+// between the first check and the increment. ~Guard releases the
+// counter so deactivate()'s spin loop can make progress.
+class RingUserGuard {
+public:
+    RingUserGuard(std::atomic<int>& users, const std::atomic<bool>& active)
+        : users_(users), active_(false) {
+        if (!active.load(std::memory_order_acquire)) return;
+        // acq_rel ensures the increment is visible to deactivate()'s
+        // load(acquire) and that we observe a subsequent store of
+        // m_active==false.
+        users_.fetch_add(1, std::memory_order_acq_rel);
+        if (!active.load(std::memory_order_acquire)) {
+            // Lost the race: deactivate() set m_active=false either
+            // before or concurrently with our increment. Roll back; we
+            // never entered the guarded section, so relaxed is fine.
+            users_.fetch_sub(1, std::memory_order_relaxed);
+            return;
+        }
+        active_ = true;
+    }
+
+    ~RingUserGuard() {
+        if (active_) {
+            // release ensures all ring ops complete before the
+            // decrement is visible to deactivate().
+            users_.fetch_sub(1, std::memory_order_release);
+        }
+    }
+
+    bool active() const { return active_; }
+
+    RingUserGuard(const RingUserGuard&) = delete;
+    RingUserGuard& operator=(const RingUserGuard&) = delete;
+
+private:
+    std::atomic<int>& users_;
+    bool active_;
+};
+} // anonymous namespace
+
 ScreamDirettaSync::ScreamDirettaSync() = default;
 ScreamDirettaSync::~ScreamDirettaSync() = default;
+
+void ScreamDirettaSync::deactivate() {
+    // Two-phase shutdown: flip the gate first so new getNewStream cycles
+    // bail at Gate 0, then spin until any cycle that already passed the
+    // first m_active check has exited its RingUserGuard. After this
+    // returns the owner (DirettaState) is guaranteed no SDK pull is
+    // inside m_ring access and may safely resize / free the
+    // externally-owned ring buffer. Cycles are ~hundreds of microseconds
+    // long so the yield loop is bounded in practice; we deliberately do
+    // not impose a deadline because a forced detach here would re-
+    // introduce the use-after-free we are trying to eliminate.
+    m_active.store(false, std::memory_order_release);
+    while (m_ringUsers.load(std::memory_order_acquire) > 0) {
+        std::this_thread::yield();
+    }
+}
 
 void ScreamDirettaSync::configureFormat(uint32_t sampleRate,
                                         uint32_t channels,
@@ -168,7 +230,14 @@ bool ScreamDirettaSync::getNewStream(diretta_stream& s) {
 
     // Gate 0: if the Sync is being torn down, emit silence without touching
     // the externally-owned ring (which may be resizing or destroyed).
-    if (!m_active.load(std::memory_order_acquire)) {
+    //
+    // RingUserGuard pairs with deactivate(): once it returns active(),
+    // deactivate() is guaranteed to wait for our destructor before
+    // letting the owner resize/free m_ring. The two-phase check inside
+    // the guard closes the race where deactivate() flips m_active=false
+    // between our load and our increment.
+    RingUserGuard ringGuard(m_ringUsers, m_active);
+    if (!ringGuard.active()) {
         if (want > 0) {
             if (m_streamData.size() < want) {
                 m_streamData.assign(want, m_silenceByte.load(std::memory_order_acquire));
