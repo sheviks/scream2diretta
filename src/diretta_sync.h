@@ -186,6 +186,13 @@ protected:
     // SDK pull-mode callback. Single override needed.
     bool getNewStream(diretta_stream& s) override;
 
+    // SDK callback at --info-cycle rate (after each SDK<->Target
+    // information/control/status packet exchange). This is the clean,
+    // designed hook for observing the results of the exchange.
+    // Body must be cheap (a few atomic stores); runs on SDK control thread,
+    // not the data hot path.
+    void statusUpdate() override;
+
 private:
     // Externally owned. Owner (DirettaState) guarantees the pointer remains
     // valid for the Sync's lifetime — it is sized once per format-change
@@ -279,11 +286,35 @@ private:
     std::atomic<size_t>   m_realDelayEmitted{0};
     std::atomic<bool>     m_realDelayDone{true};
     std::atomic<uint64_t> m_realDelayCycles{0};
+
+    // Live info-exchange state captured in statusUpdate() (info-cycle rate).
+    // See public accessors lastInfo*() and infoUpdateCount() above.
+    // Always maintained (production + debug builds).
+    std::atomic<uint64_t> m_lastInfoCycleUs{0};
+    std::atomic<int>      m_lastInfoMode{0};
+    std::atomic<uint64_t> m_lastInfoLatencyUs{0};
+    std::atomic<uint64_t> m_infoUpdateCount{0};
 public:
     size_t   realDelayBytes()         const { return m_realDelayBytes.load(std::memory_order_acquire); }
     size_t   realDelayBytesEmitted()  const { return m_realDelayEmitted.load(std::memory_order_acquire); }
     bool     realDelayDone()          const { return m_realDelayDone.load(std::memory_order_acquire); }
     uint64_t realDelayCycles()        const { return m_realDelayCycles.load(std::memory_order_acquire); }
+
+    // Live values captured from the most recent SDK statusUpdate() (called
+    // internally by the SDK at the --info-cycle rate after each
+    // information/control/status packet exchange with the Target).
+    // These reflect what the SDK learned from the Target during the exchange.
+    // In TargetProfile mode (target_profile_limit_us > 0) the cycle etc. may
+    // adapt over time; in SelfProfile (0) they are stable after open.
+    // These are *monitoring*, not per-packet diagnostics. The capture runs
+    // on an SDK internal control/info thread (not the data send thread that
+    // calls getNewStream(), and not our receiver thread), so it has no
+    // impact on the audio hot path. The values are always maintained (like
+    // realCycles / silentCycles) even in production builds.
+    uint64_t lastInfoCycleUs()   const { return m_lastInfoCycleUs.load(std::memory_order_acquire); }
+    int      lastInfoMode()      const { return m_lastInfoMode.load(std::memory_order_acquire); }
+    uint64_t lastInfoLatencyUs() const { return m_lastInfoLatencyUs.load(std::memory_order_acquire); }
+    uint64_t infoUpdateCount()   const { return m_infoUpdateCount.load(std::memory_order_acquire); }
 };
 
 } // namespace scream_diretta

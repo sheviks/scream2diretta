@@ -15,6 +15,8 @@
 #include <iostream>
 #include <thread>
 
+extern int verbosity;
+
 #if defined(__linux__)
 #include <pthread.h>
 #include <sched.h>
@@ -448,6 +450,63 @@ bool ScreamDirettaSync::getNewStream(diretta_stream& s) {
         }
     }
     return true;
+}
+
+void ScreamDirettaSync::statusUpdate() {
+    // Called by the Diretta SDK (on one of its internal threads associated
+    // with info/control handling) each time an information packet exchange
+    // with the Target completes, at the period specified by the `info`
+    // argument to Sync::open() (i.e. --info-cycle, default 100 ms).
+    //
+    // This is *not* the high-rate data path. The data path is the SDK
+    // "send thread" that repeatedly calls our getNewStream() override
+    // (pinned via OCCUPIED + cpu-audio). statusUpdate is control/status
+    // telemetry, typically on a helper/"other" thread (see cpu-other).
+    //
+    // Therefore, work here has **no impact** on the audio hot path
+    // (receiver thread in scream.c or the getNewStream worker).
+    //
+    // We perform only cheap, lock-free captures of values that the SDK
+    // may have refreshed from the just-exchanged info/status/feedback
+    // packet(s). This is monitoring (cf. the always-on realCycles etc.
+    // counters) and is compiled into both the production binary and the
+    // debug binary. Pure per-packet diagnostics (dumps, analysers) remain
+    // gated by diretta_diag_armed() + DCE under NO_DIAGNOSTICS exactly
+    // as before the cleanup.
+    //
+    // In SelfProfile (target_profile_limit_us==0) the captured cycle/mode
+    // are expected to be stable after open. In TargetProfile (>0) they
+    // may change over time as the SDK adapts using Target feedback.
+    m_lastInfoCycleUs.store(
+        static_cast<uint64_t>(getCycleTime().getMicroSeconds()),
+        std::memory_order_release);
+    m_lastInfoMode.store(
+        static_cast<int>(getMode()),
+        std::memory_order_release);
+    m_lastInfoLatencyUs.store(
+        static_cast<uint64_t>(getLatency().getMicroSeconds()),
+        std::memory_order_release);
+    uint64_t count = m_infoUpdateCount.fetch_add(1, std::memory_order_relaxed) + 1;
+
+    // Under -vv (verbosity >= 2), periodically log that an info-cycle exchange
+    // was processed and what the SDK now reports. Throttled to avoid log spam
+    // (roughly once per second at default 100ms info cycle). This is the
+    // visible evidence that we are receiving the per-info-cycle status from
+    // the SDK<->Target exchange.
+    if (verbosity >= 2) {
+        static std::atomic<uint64_t> last_logged{0};
+        uint64_t prev = last_logged.load(std::memory_order_relaxed);
+        if (count - prev >= 10) {  // ~1s
+            if (last_logged.compare_exchange_strong(prev, count, std::memory_order_relaxed)) {
+                std::fprintf(stderr,
+                    "[diretta] info-cycle update #%llu: live_cycle=%lldus mode=%d latency=%lldus\n",
+                    (unsigned long long)count,
+                    (long long)getCycleTime().getMicroSeconds(),
+                    (int)getMode(),
+                    (long long)getLatency().getMicroSeconds());
+            }
+        }
+    }
 }
 
 } // namespace scream_diretta

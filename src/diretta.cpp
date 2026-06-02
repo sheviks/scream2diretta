@@ -1687,6 +1687,10 @@ static uint32_t open_sync_worker_blocking(scream_diretta::ScreamDirettaSync*& ou
                  (unsigned)eff_mtu, applied_mode, target_cycle, sdk_cycle,
                  (size_t)sync->getCycleSize(),
                  (size_t)sync->getCyclePackets());
+            if (cfg.target_profile_limit_us > 0) {
+                DLOG(2, "info-cycle telemetry active (TargetProfile): period=%d us (live values from statusUpdate will be reported in stats when cycle adapts)",
+                     cfg.info_cycle_us > 0 ? cfg.info_cycle_us : 100000);
+            }
         }
 
         g_st.target_cycle_us = static_cast<uint64_t>(target_cycle);
@@ -2546,12 +2550,19 @@ static void format_stats_line(const char* tag, char* out, size_t outlen) {
         const long long prev_fill_b = (long long)g_st.last_stats_ring_fill_bytes;
         fill_delta_ms = (long long)(((cur_fill_b - prev_fill_b) * 1000) / (long long)bps);
     }
+    char live_suffix[64] = "";
+    if (s.info_update_count > 0 && s.current_sdk_cycle_us != s.sdk_cycle_us) {
+        std::snprintf(live_suffix, sizeof(live_suffix),
+                      " | live-cycle=%lluus (updates=%llu)",
+                      (unsigned long long)s.current_sdk_cycle_us,
+                      (unsigned long long)s.info_update_count);
+    }
     std::snprintf(out, outlen,
         "[diretta] %s: pushed=%llu B / %llu fr | dropped=%llu B / %llu fr / %llu ms"
         " | partial_carry=%llu | fmt_changes=%llu | underruns=%llu (events=%llu)"
         " | fill=%llu/%llu B (~%llu ms) | cycles real=%llu silent=%llu"
         " | push_delta_ms=%lld drain_delta_ms=%lld net_fill_delta_ms=%lld "
-        "fill_delta_ms=%lld%s",
+        "fill_delta_ms=%lld%s%s",
         tag,
         (unsigned long long)s.pushed_bytes,
         (unsigned long long)s.pushed_frames,
@@ -2568,7 +2579,8 @@ static void format_stats_line(const char* tag, char* out, size_t outlen) {
         (unsigned long long)s.real_cycles,
         (unsigned long long)s.silent_cycles,
         push_delta_ms, drain_delta_ms, net_fill_delta_ms, fill_delta_ms,
-        s.dsd_active ? " | dsd" : "");
+        s.dsd_active ? " | dsd" : "",
+        live_suffix);
 
     g_st.last_stats_pushed_bytes     = s.pushed_bytes;
     g_st.last_stats_popped_bytes     = s.popped_bytes;
@@ -3945,6 +3957,14 @@ extern "C" int diretta_get_stats(diretta_stats_t *out) {
         out->real_cycles   = g_st.sync->realCycles();
         out->underrun_events = g_st.sync->underrunEvents();
         out->popped_bytes    = g_st.sync->poppedBytes();
+        // Live info-exchange snapshot (refreshed by SDK at --info-cycle
+        // via statusUpdate()). Safe to read from any thread; these are
+        // the values the SDK learned from the Target during the most
+        // recent info/control/status packet exchange.
+        out->current_sdk_cycle_us = g_st.sync->lastInfoCycleUs();
+        out->current_profile_mode = static_cast<uint64_t>(g_st.sync->lastInfoMode());
+        out->current_latency_us   = g_st.sync->lastInfoLatencyUs();
+        out->info_update_count    = g_st.sync->infoUpdateCount();
     }
     out->target_cycle_us = g_st.target_cycle_us;
     out->sdk_cycle_us    = g_st.sdk_cycle_us;
