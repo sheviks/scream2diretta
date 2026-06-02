@@ -11,6 +11,11 @@
 #include <cstdlib>
 #include <vector>
 
+// C-linkage gate flag declared in receiver_tap.h. Read by the static
+// inline receiver_tap_any_armed() at call sites for branch-predictor-
+// friendly early-out. Writes are confined to receiver_tap_init().
+extern "C" int g_receiver_tap_any_armed_flag = 0;
+
 namespace {
 
 struct ReceiverTapState {
@@ -230,6 +235,26 @@ void receiver_tap_init(const char* payload_prefix,
                        int analyze_ms,
                        int compare_ms,
                        int active_backend) {
+#ifdef SCREAM2DIRETTA_NO_DIAGNOSTICS
+    // Production build: diagnostics fully compiled out. Warn the user if
+    // any diagnostic flag was actually requested so they know to switch
+    // to scream2diretta-debug. Keep the function callable so scream.c can
+    // call us unconditionally without #ifdef noise at the call site.
+    (void)dump_ms; (void)active_backend;
+    const bool any_requested =
+        (payload_prefix && payload_prefix[0]) ||
+        (raw_prefix && raw_prefix[0]) ||
+        (analyze_ms > 0) ||
+        (compare_ms > 0);
+    if (any_requested) {
+        std::fprintf(stderr,
+            "[receiver-tap] warning: diagnostics not compiled into this "
+            "binary (SCREAM2DIRETTA_NO_DIAGNOSTICS). Requested flags "
+            "ignored. Rebuild as scream2diretta-debug to enable "
+            "--dump-* / --startup-analyze-ms / --compare-receiver-tap-ms.\n");
+    }
+    return;
+#else
     g_rt = ReceiverTapState{};
 
     if (dump_ms < 0) dump_ms = 0;
@@ -254,12 +279,28 @@ void receiver_tap_init(const char* payload_prefix,
     g_rt.compare_ms = compare_ms;
     g_rt.active_backend = active_backend;
 
+    // Single-point gate: any of the three diagnostic facilities armed?
+    // Read by every per-packet feed call (and the static inline header
+    // accessor used at call sites) to early-out without further work
+    // when nothing diagnostic is configured.
+    const bool analyzer_armed_payload =
+        (analyze_ms > 0); // pcm_startup_analyzer_init arms when window > 0
+    const bool analyzer_armed_raw     = (analyze_ms > 0);
+    const bool comparator_armed       =
+        (compare_ms > 0 && active_backend > 0);
+    g_receiver_tap_any_armed_flag =
+        (g_rt.payload_enabled || g_rt.raw_enabled ||
+         analyzer_armed_payload || analyzer_armed_raw ||
+         comparator_armed) ? 1 : 0;
+
     std::fprintf(stderr,
         "[receiver-tap] init: payload_dump=%s raw_dump=%s dump_ms=%d "
-        "analyze_ms=%d compare_ms=%d active_backend=%s\n",
+        "analyze_ms=%d compare_ms=%d active_backend=%s any_armed=%d\n",
         g_rt.payload_enabled ? payload_prefix : "(off)",
         g_rt.raw_enabled ? raw_prefix : "(off)",
-        dump_ms, analyze_ms, compare_ms, backend_name(active_backend));
+        dump_ms, analyze_ms, compare_ms, backend_name(active_backend),
+        g_receiver_tap_any_armed_flag);
+#endif // SCREAM2DIRETTA_NO_DIAGNOSTICS
 }
 
 int receiver_tap_payload_enabled(void) { return g_rt.payload_enabled ? 1 : 0; }
@@ -267,6 +308,7 @@ int receiver_tap_raw_enabled(void)     { return g_rt.raw_enabled ? 1 : 0; }
 
 void receiver_tap_payload_feed(const void* data, size_t bytes,
                                uint32_t rate_hz, uint32_t bits, uint32_t chans) {
+    if (__builtin_expect(!g_receiver_tap_any_armed_flag, 1)) return;
     if (data == nullptr || bytes == 0) return;
     if (!format_valid(rate_hz, bits, chans)) return;
 
@@ -302,6 +344,7 @@ void receiver_tap_payload_feed(const void* data, size_t bytes,
 
 void receiver_tap_raw_feed(const void* data, size_t bytes,
                            uint32_t rate_hz, uint32_t bits, uint32_t chans) {
+    if (__builtin_expect(!g_receiver_tap_any_armed_flag, 1)) return;
     if (data == nullptr || bytes == 0) return;
     if (!format_valid(rate_hz, bits, chans)) return;
 
@@ -336,6 +379,7 @@ void receiver_tap_raw_feed(const void* data, size_t bytes,
 void receiver_tap_diretta_raw_entry_feed(const void* data, size_t bytes,
                                       uint32_t rate_hz, uint32_t bits,
                                       uint32_t chans) {
+    if (__builtin_expect(!g_receiver_tap_any_armed_flag, 1)) return;
     if (data == nullptr || bytes == 0) return;
     if (!format_valid(rate_hz, bits, chans)) return;
     if (g_rt.active_backend == 2) {

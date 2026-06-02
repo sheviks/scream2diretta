@@ -224,7 +224,12 @@ build_scream2diretta() {
     make -j$(nproc)
     if [ -f "scream2diretta" ]; then
         print_success "Build successful!"
-        print_info "Binary: $SCRIPT_DIR/build/scream2diretta"
+        print_info "Production binary: $SCRIPT_DIR/build/scream2diretta"
+        print_info "  (diagnostics compiled out -- zero per-packet overhead)"
+        if [ -f "scream2diretta-debug" ]; then
+            print_info "Debug binary:      $SCRIPT_DIR/build/scream2diretta-debug"
+            print_info "  (full --dump-* / --startup-analyze-ms / --compare-receiver-tap-ms)"
+        fi
     else
         print_error "Build failed. Check error messages above."
         exit 1

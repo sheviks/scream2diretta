@@ -5,23 +5,38 @@ project(scream2diretta VERSION 0.3 LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# We build two binaries from the same source tree:
+#
+#   scream2diretta        production build, -DSCREAM2DIRETTA_NO_DIAGNOSTICS
+#                         All diagnostic taps (--dump-*, --startup-analyze-ms,
+#                         --compare-receiver-tap-ms) are compile-time-disabled.
+#                         The static inline receiver_tap_any_armed() in
+#                         receiver_tap.h becomes a constant 0, so every
+#                         per-packet `if (receiver_tap_any_armed())` block in
+#                         scream.c / raw.c / diretta.cpp gets DCE'd by the
+#                         compiler. Zero per-packet diagnostic overhead.
+#
+#   scream2diretta-debug  full build with all diagnostic facilities armed
+#                         at runtime via CLI flags. Same source, same Diretta
+#                         path, single extra runtime branch per packet when
+#                         nothing is armed.
+#
+# All option() flags below (DIRETTA_ENABLE / PULSEAUDIO_ENABLE / ALSA_ENABLE /
+# JACK_ENABLE / PCAP_ENABLE / SNDIO_ENABLE / DIRETTA_NOLOG / DIRETTA_SDK_ROOT /
+# DIRETTA_ARCH_SUFFIX) are honoured identically by both targets.
+option(SCREAM2DIRETTA_BUILD_DEBUG_VARIANT
+       "Also build scream2diretta-debug (full diagnostics)" ON)
 
-add_executable(${PROJECT_NAME}
+set(SCREAM2DIRETTA_SOURCES
     src/scream.c src/network.c src/shmem.c src/raw.c
     src/pcm_dump.cpp src/pcm_startup.cpp src/receiver_tap.cpp)
-target_compile_definitions(${PROJECT_NAME} PRIVATE SCREAM2DIRETTA_VERSION="${PROJECT_VERSION}")
 
 # find pulseaudio
 option(PULSEAUDIO_ENABLE "Enable PulseAudio" ON)
 if (PULSEAUDIO_ENABLE)
   find_package(PkgConfig)
   pkg_check_modules(PULSEAUDIO libpulse-simple)
-  if (PULSEAUDIO_FOUND)
-    include_directories(${PULSEAUDIO_INCLUDE_DIRS})
-    target_link_directories(${PROJECT_NAME} PUBLIC ${PULSEAUDIO_LIBRARY_DIRS})
-    target_link_libraries(${PROJECT_NAME} ${PULSEAUDIO_LIBRARIES})
-    target_sources(${PROJECT_NAME} PRIVATE src/pulseaudio.c)
-  else ()
+  if (NOT PULSEAUDIO_FOUND)
     set(PULSEAUDIO_ENABLE OFF)
   endif ()
 endif ()
@@ -31,12 +46,7 @@ option(ALSA_ENABLE "Enable ALSA" ON)
 if (ALSA_ENABLE)
   find_package(PkgConfig)
   pkg_check_modules(PC_ALSA alsa)
-  if (PC_ALSA_FOUND)
-    include_directories(${PC_ALSA_INCLUDEDIR})
-    target_link_directories(${PROJECT_NAME} PUBLIC ${PC_ALSA_LIBRARY_DIRS})
-    target_link_libraries(${PROJECT_NAME} ${PC_ALSA_LIBRARIES})
-    target_sources(${PROJECT_NAME} PRIVATE src/alsa.c)
-  else ()
+  if (NOT PC_ALSA_FOUND)
     set(ALSA_ENABLE OFF)
   endif ()
 endif ()
@@ -47,28 +57,17 @@ if (JACK_ENABLE)
   find_package(PkgConfig)
   pkg_check_modules(PC_JACK jack)
   pkg_check_modules(PC_LIBSOXR soxr)
-  if(PC_JACK_FOUND AND PC_LIBSOXR_FOUND)
-    include_directories(${PC_JACK_INCLUDEDIR} ${PC_LIBSOXR_INCLUDEDIR})
-    target_link_directories(${PROJECT_NAME} PUBLIC ${PC_JACK_LIBRARY_DIRS})
-    target_link_libraries(${PROJECT_NAME} ${PC_JACK_LIBRARIES} ${PC_LIBSOXR_LIBRARIES})
-    target_sources(${PROJECT_NAME} PRIVATE src/jack.c)
-  else ()
+  if (NOT (PC_JACK_FOUND AND PC_LIBSOXR_FOUND))
     set(JACK_ENABLE OFF)
   endif ()
 endif ()
-
 
 # find libpcap
 option(PCAP_ENABLE "Enable PCAP" ON)
 if (PCAP_ENABLE)
   find_package(PkgConfig)
   pkg_check_modules(PC_PCAP libpcap)
-  if (PC_PCAP_FOUND)
-    include_directories(${PC_PCAP_INCLUDEDIR})
-    target_link_directories(${PROJECT_NAME} PUBLIC ${PC_PCAP_LIBRARY_DIRS})
-    target_link_libraries(${PROJECT_NAME} ${PC_PCAP_LIBRARIES})
-    target_sources(${PROJECT_NAME} PRIVATE src/pcap_input.c)
-  else ()
+  if (NOT PC_PCAP_FOUND)
     set(PCAP_ENABLE OFF)
   endif ()
 endif ()
@@ -89,12 +88,7 @@ if (SNDIO_ENABLE)
         return 0;
       }
     " SNDIO_USABLE)
-    if (SNDIO_USABLE)
-      include_directories(${PC_SNDIO_INCLUDEDIR})
-      target_link_directories(${PROJECT_NAME} PUBLIC ${PC_SNDIO_LIBRARY_DIRS})
-      target_link_libraries(${PROJECT_NAME} ${PC_SNDIO_LIBRARIES})
-      target_sources(${PROJECT_NAME} PRIVATE src/sndio.c)
-    else ()
+    if (NOT SNDIO_USABLE)
       message(WARNING "sndio headers found but unusable (incomplete); disabling sndio support")
       set(SNDIO_ENABLE OFF)
     endif ()
@@ -137,21 +131,76 @@ if (DIRETTA_ENABLE)
   if (NOT EXISTS "${_diretta_libACQUA}")
     message(FATAL_ERROR "ACQUA SDK library not found: ${_diretta_libACQUA}")
   endif ()
-  target_sources(${PROJECT_NAME} PRIVATE src/diretta.cpp src/diretta_sync.cpp)
-  target_include_directories(${PROJECT_NAME} PRIVATE "${DIRETTA_SDK_ROOT}/Host")
-  # The SDK archives cross-reference each other; --start-group/--end-group
-  # is the most reliable way to satisfy that without ordering surprises.
-  target_link_libraries(${PROJECT_NAME}
-    -Wl,--start-group
-    "${_diretta_libDiretta}"
-    "${_diretta_libACQUA}"
-    -Wl,--end-group
-    pthread m stdc++)
 endif ()
 
-target_include_directories(${PROJECT_NAME} PRIVATE src)
+# Helper: define one scream2diretta target with the shared option matrix.
+#
+#   target_name : output executable name
+#   no_diag     : if ON, define SCREAM2DIRETTA_NO_DIAGNOSTICS
+function(scream2diretta_define_target target_name no_diag)
+  add_executable(${target_name} ${SCREAM2DIRETTA_SOURCES})
+  target_compile_definitions(${target_name} PRIVATE
+      SCREAM2DIRETTA_VERSION="${PROJECT_VERSION}")
+  if (no_diag)
+    target_compile_definitions(${target_name} PRIVATE SCREAM2DIRETTA_NO_DIAGNOSTICS)
+  endif ()
+  target_include_directories(${target_name} PRIVATE src)
+  target_include_directories(${target_name} PUBLIC "${PROJECT_BINARY_DIR}")
+
+  if (PULSEAUDIO_ENABLE)
+    target_include_directories(${target_name} PRIVATE ${PULSEAUDIO_INCLUDE_DIRS})
+    target_link_directories(${target_name} PUBLIC ${PULSEAUDIO_LIBRARY_DIRS})
+    target_link_libraries(${target_name} ${PULSEAUDIO_LIBRARIES})
+    target_sources(${target_name} PRIVATE src/pulseaudio.c)
+  endif ()
+  if (ALSA_ENABLE)
+    target_include_directories(${target_name} PRIVATE ${PC_ALSA_INCLUDEDIR})
+    target_link_directories(${target_name} PUBLIC ${PC_ALSA_LIBRARY_DIRS})
+    target_link_libraries(${target_name} ${PC_ALSA_LIBRARIES})
+    target_sources(${target_name} PRIVATE src/alsa.c)
+  endif ()
+  if (JACK_ENABLE)
+    target_include_directories(${target_name} PRIVATE ${PC_JACK_INCLUDEDIR} ${PC_LIBSOXR_INCLUDEDIR})
+    target_link_directories(${target_name} PUBLIC ${PC_JACK_LIBRARY_DIRS})
+    target_link_libraries(${target_name} ${PC_JACK_LIBRARIES} ${PC_LIBSOXR_LIBRARIES})
+    target_sources(${target_name} PRIVATE src/jack.c)
+  endif ()
+  if (PCAP_ENABLE)
+    target_include_directories(${target_name} PRIVATE ${PC_PCAP_INCLUDEDIR})
+    target_link_directories(${target_name} PUBLIC ${PC_PCAP_LIBRARY_DIRS})
+    target_link_libraries(${target_name} ${PC_PCAP_LIBRARIES})
+    target_sources(${target_name} PRIVATE src/pcap_input.c)
+  endif ()
+  if (SNDIO_ENABLE)
+    target_include_directories(${target_name} PRIVATE ${PC_SNDIO_INCLUDEDIR})
+    target_link_directories(${target_name} PUBLIC ${PC_SNDIO_LIBRARY_DIRS})
+    target_link_libraries(${target_name} ${PC_SNDIO_LIBRARIES})
+    target_sources(${target_name} PRIVATE src/sndio.c)
+  endif ()
+  if (DIRETTA_ENABLE)
+    target_sources(${target_name} PRIVATE src/diretta.cpp src/diretta_sync.cpp)
+    target_include_directories(${target_name} PRIVATE "${DIRETTA_SDK_ROOT}/Host")
+    target_link_libraries(${target_name}
+      -Wl,--start-group
+      "${_diretta_libDiretta}"
+      "${_diretta_libACQUA}"
+      -Wl,--end-group
+      pthread m stdc++)
+  endif ()
+endfunction()
+
+# Production binary: no diagnostics. Installed by default.
+scream2diretta_define_target(scream2diretta ON)
+
+# Debug binary: same code, full diagnostics armable at runtime.
+if (SCREAM2DIRETTA_BUILD_DEBUG_VARIANT)
+  scream2diretta_define_target(scream2diretta-debug OFF)
+endif ()
+
 configure_file(config.h.in config.h)
-target_include_directories(${PROJECT_NAME} PUBLIC "${PROJECT_BINARY_DIR}")
 
 include(GNUInstallDirs)
-install(TARGETS ${PROJECT_NAME} RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
+install(TARGETS scream2diretta RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
+if (SCREAM2DIRETTA_BUILD_DEBUG_VARIANT)
+  install(TARGETS scream2diretta-debug RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
+endif ()

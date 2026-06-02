@@ -298,7 +298,7 @@ int diretta_apply_rt_priority(int priority);
 /* Discover targets and print a numbered list to stdout, then return. Returns
  * 0 on success (even if no sinks are found -- it just prints "no targets"),
  * non-zero on SDK init failure. */
-int diretta_list_targets(const diretta_config_t *cfg);
+int diretta_list_targets(const diretta_config_t *cfg, const char *progname);
 
 /* Open the SDK, pick the target by cfg->target_index, measure MTU, and
  * leave the backend ready for diretta_output_send() calls. */

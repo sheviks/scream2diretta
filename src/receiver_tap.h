@@ -99,6 +99,28 @@ void receiver_tap_shutdown(void);
 int  receiver_tap_payload_enabled(void);
 int  receiver_tap_raw_enabled(void);
 
+// Single-point fast-path gate. Computed once in receiver_tap_init() as
+// (payload_dump || raw_dump || analyze_ms>0 || (compare_ms>0 && backend>0)).
+// Exposed as a plain int so call sites in C and C++ can early-out before
+// computing rate/bits/channels or making any non-inline call. Inspect via
+// the static inline accessor below; the variable itself must not be
+// written outside receiver_tap_init().
+//
+// When SCREAM2DIRETTA_NO_DIAGNOSTICS is defined at compile time
+// (production builds), the accessor returns a compile-time constant 0
+// so the compiler dead-code-eliminates every `if (receiver_tap_any_armed())`
+// guarded block at the call site. The diagnostic implementation
+// (receiver_tap.cpp, pcm_dump.cpp, pcm_startup.cpp) is still linked, but
+// the per-packet hot path costs zero instructions.
+#ifdef SCREAM2DIRETTA_NO_DIAGNOSTICS
+static inline int receiver_tap_any_armed(void) { return 0; }
+#else
+extern int g_receiver_tap_any_armed_flag;
+static inline int receiver_tap_any_armed(void) {
+    return g_receiver_tap_any_armed_flag;
+}
+#endif
+
 #ifdef __cplusplus
 }
 #endif

@@ -883,7 +883,7 @@ int main(int argc, char*argv[]) {
   else dcfg.log_level = DIRETTA_LOG_DEFAULT;
 
   if (do_list_targets) {
-    return diretta_list_targets(&dcfg);
+    return diretta_list_targets(&dcfg, argv[0]);
   }
 #else
   (void)quiet;
@@ -938,11 +938,20 @@ int main(int argc, char*argv[]) {
    * verbosity >= 2 or any --dump-*-wav is enabled (so the diagnostic data
    * lands in the log alongside the dump files). The user can disable it
    * explicitly with --startup-analyze-ms 0. The fade and shape default to
-   * 0/linear (no audio change). */
+   * 0/linear (no audio change).
+   *
+   * In SCREAM2DIRETTA_NO_DIAGNOSTICS builds the auto-enable is suppressed
+   * so a bare `-vv` does not silently arm a facility the binary cannot
+   * service (which would then trigger the [diretta] "diagnostics not
+   * compiled into this binary" warning at init). Explicit user flags
+   * still flow through and still trigger the warning, which is intended.
+   */
   if (startup_analyze_ms_user_set) {
     dcfg.startup_analyze_ms = startup_analyze_ms_value;
+#ifndef SCREAM2DIRETTA_NO_DIAGNOSTICS
   } else if (verbosity >= 2 || dump_ingress_prefix || dump_egress_prefix) {
     dcfg.startup_analyze_ms = 100;
+#endif
   } else {
     dcfg.startup_analyze_ms = 0;
   }
@@ -1103,6 +1112,7 @@ int main(int argc, char*argv[]) {
     int rt_analyze_ms;
     if (startup_analyze_ms_user_set) {
       rt_analyze_ms = startup_analyze_ms_value;
+#ifndef SCREAM2DIRETTA_NO_DIAGNOSTICS
     } else if (verbosity >= 2 ||
                dump_receiver_payload_prefix ||
                dump_raw_stdout_prefix ||
@@ -1110,6 +1120,7 @@ int main(int argc, char*argv[]) {
                dump_egress_prefix ||
                dump_raw_entry_prefix) {
       rt_analyze_ms = 100;
+#endif
     } else {
       rt_analyze_ms = 0;
     }
@@ -1184,8 +1195,13 @@ int main(int argc, char*argv[]) {
      * data->audio / data->audio_size match exactly what the backend
      * receives. Source format is recovered from data->format the same
      * way every backend does it. No-op unless --dump-receiver-payload-wav
-     * or --compare-receiver-tap-ms is in effect. */
-    {
+     * or --compare-receiver-tap-ms is in effect.
+     *
+     * Fast-path: skip even the format decode when no diagnostic facility
+     * is armed. The static inline gate reads a single int set once at
+     * init, so the common fully-off case folds into a predictable branch
+     * with zero function-call overhead. */
+    if (receiver_tap_any_armed()) {
       const receiver_format_t* rf = &receiver_data.format;
       uint32_t base = (rf->sample_rate >= 128) ? 44100u : 48000u;
       uint32_t mult = (uint32_t)(rf->sample_rate % 128u);

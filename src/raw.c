@@ -80,10 +80,15 @@ int raw_output_send(receiver_data_t *data)
   // conversion step, removing one source of human error from the
   // diagnostic. No-op unless --dump-raw-stdout-wav is set or
   // --compare-receiver-tap-ms is active with -o stdout.
-  receiver_tap_raw_feed(data->audio, data->audio_size,
-                        (uint32_t)ro_data.rate,
-                        (uint32_t)rf->sample_size,
-                        (uint32_t)rf->channels);
+  //
+  // Fast-path: skip the call entirely when no diagnostic facility is
+  // armed. The static inline gate folds to a single int load + branch.
+  if (receiver_tap_any_armed()) {
+    receiver_tap_raw_feed(data->audio, data->audio_size,
+                          (uint32_t)ro_data.rate,
+                          (uint32_t)rf->sample_size,
+                          (uint32_t)rf->channels);
+  }
 
   fwrite(data->audio, 1, data->audio_size, stdout);
 

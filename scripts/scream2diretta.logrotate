@@ -1,16 +1,23 @@
 # Logrotate configuration for scream2diretta
 # Install to /etc/logrotate.d/scream2diretta
 #
+# The service writes to /var/log/scream2diretta.log via systemd
+# StandardOutput=append:/var/log/scream2diretta.log.  Because systemd
+# keeps the file descriptor open, we use copytruncate so rotation does
+# not require a service restart or signal.
+#
 # Both 'daily' and 'size' are present: rotation triggers on whichever
 # condition is met first.  This prevents unbounded growth during
 # extended debug sessions or persistent underrun storms.
 /var/log/scream2diretta.log {
     daily
     size 10M
-    rotate 7
+    rotate 14
     compress
     delaycompress
     missingok
     notifempty
-    create 0644 root root
+    copytruncate
+    # create is intentionally omitted: copytruncate preserves the
+    # existing file inode so systemd's append fd stays valid.
 }

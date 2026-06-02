@@ -14,6 +14,7 @@ extern "C" {
 #include "pcm_dump.h"
 #include "pcm_startup.h"
 #include "receiver_tap.h"
+#include "diretta_diag.h"
 }
 
 #include "diretta_sync.h"
@@ -354,6 +355,21 @@ enum AsyncOpenState : int {
 };
 
 DirettaState g_st;
+
+// Single-point armed gate for Diretta-backend-internal diagnostic
+// facilities (ingress/egress/raw-entry dumpers, startup analysers,
+// startup fader, ingress-tap comparator). Computed once at the end of
+// diretta_output_init() and read-only thereafter. Read by
+// queue_push_frames(), the raw-entry tap in diretta_output_send(), and
+// the egress-side feeds in ScreamDirettaSync::getNewStream() via the
+// static inline diretta_diag_armed() accessor in diretta_diag.h.
+//
+// In SCREAM2DIRETTA_NO_DIAGNOSTICS builds the accessor folds to a
+// compile-time constant 0, so this symbol is unused in the production
+// binary; we still define it to keep the linkage symmetrical.
+#ifndef SCREAM2DIRETTA_NO_DIAGNOSTICS
+extern "C" int g_diretta_diag_armed_flag = 0;
+#endif
 
 #define DLOG(level, fmt, ...) do { \
     if (verbosity >= (level)) { \
@@ -1201,28 +1217,36 @@ static void cmp_maybe_emit_summary(void) {
 // of bpf.
 static inline void queue_push_frames(const uint8_t* data, size_t bytes, uint32_t bpf) {
     if (!g_st.queue_ready || bpf == 0 || bytes == 0) return;
-    // Ingress PCM dump. Runs BEFORE pushFrames so that even if the
-    // ring drops on overflow, we still capture the exact bytes that came
-    // off the wire after frame-alignment. The ingress dumper is single-
-    // producer (receive thread) so no locking is required.
-    if (pcm_dumper_enabled(&g_st.ingress_dumper)) {
-        if (pcm_dumper_open_or_rotate(&g_st.ingress_dumper,
-                                      g_st.sample_rate, g_st.channels,
-                                      g_st.bits_per_sample)) {
-            pcm_dumper_write(&g_st.ingress_dumper, data, bytes);
+    // Diagnostic block: ingress dumper + ingress-tap comparator + ingress
+    // startup analyser. All three are owned by the Diretta backend and
+    // gated by the single diretta_diag_armed() flag computed once at init.
+    // In SCREAM2DIRETTA_NO_DIAGNOSTICS builds the accessor folds to
+    // constant 0 and the entire block is DCE'd -- the per-packet hot path
+    // is just the early-exit check above plus pushFrames() below.
+    if (__builtin_expect(diretta_diag_armed(), 0)) {
+        // Ingress PCM dump. Runs BEFORE pushFrames so that even if the
+        // ring drops on overflow, we still capture the exact bytes that came
+        // off the wire after frame-alignment. The ingress dumper is single-
+        // producer (receive thread) so no locking is required.
+        if (pcm_dumper_enabled(&g_st.ingress_dumper)) {
+            if (pcm_dumper_open_or_rotate(&g_st.ingress_dumper,
+                                          g_st.sample_rate, g_st.channels,
+                                          g_st.bits_per_sample)) {
+                pcm_dumper_write(&g_st.ingress_dumper, data, bytes);
+            }
         }
-    }
-    // Comparator: capture the post-frame-align ingress bytes. Same
-    // window as the raw-entry tap; once both buffers are full the summary
-    // line fires.
-    cmp_capture(g_st.cmp_ingress_buf, g_st.cmp_ingress_filled, data, bytes);
-    cmp_maybe_emit_summary();
-    // Ingress startup analyser. Inspects the first N ms of PCM after
-    // each format/open and emits a single summary line. The ingress
-    // analyser observes the raw queue input -- never affected by the
-    // egress fade (which only mutates the SDK cycle buffer).
-    if (!pcm_startup_analyzer_done(&g_st.ingress_analyzer)) {
-        pcm_startup_analyzer_feed(&g_st.ingress_analyzer, data, bytes);
+        // Comparator: capture the post-frame-align ingress bytes. Same
+        // window as the raw-entry tap; once both buffers are full the summary
+        // line fires.
+        cmp_capture(g_st.cmp_ingress_buf, g_st.cmp_ingress_filled, data, bytes);
+        cmp_maybe_emit_summary();
+        // Ingress startup analyser. Inspects the first N ms of PCM after
+        // each format/open and emits a single summary line. The ingress
+        // analyser observes the raw queue input -- never affected by the
+        // egress fade (which only mutates the SDK cycle buffer).
+        if (!pcm_startup_analyzer_done(&g_st.ingress_analyzer)) {
+            pcm_startup_analyzer_feed(&g_st.ingress_analyzer, data, bytes);
+        }
     }
     g_st.queue.pushFrames(data, bytes, bpf);
 }
@@ -2394,6 +2418,17 @@ static void poll_underrun_events() {
     if (!g_st.sync) return;
     const uint64_t cur_events = g_st.sync->underrunEvents();
     const bool cur_rebuffering = g_st.sync->rebuffering();
+
+    // Fast path: no state change → skip chrono::now() and bps math
+    // entirely. In steady state this is hit on every receiver-thread
+    // packet (~hundreds/sec) so deferring the vDSO clock_gettime call
+    // until something actually changed measurably trims the per-packet
+    // overhead.
+    const bool any_change =
+        (cur_events > g_st.last_observed_underrun_events) ||
+        (g_st.rebuffering_logged && !cur_rebuffering);
+    if (__builtin_expect(!any_change, 1)) return;
+
     const auto now = std::chrono::steady_clock::now();
     const uint64_t bps = static_cast<uint64_t>(g_st.sample_rate) *
                          static_cast<uint64_t>(g_st.bytes_per_frame);
@@ -2759,7 +2794,7 @@ extern "C" void diretta_config_init(diretta_config_t *cfg) {
     cfg->startup_fade_shape = 0; /* linear */
 }
 
-extern "C" int diretta_list_targets(const diretta_config_t *cfg) {
+extern "C" int diretta_list_targets(const diretta_config_t *cfg, const char *progname) {
     diretta_config_t local;
     if (cfg) local = *cfg; else diretta_config_init(&local);
 
@@ -2788,21 +2823,55 @@ extern "C" int diretta_list_targets(const diretta_config_t *cfg) {
         return 0;
     }
 
-    std::printf("Discovered Diretta targets:\n");
-    std::printf("%-5s %-46s %-32s %-8s %s\n",
-                "IDX", "ADDRESS", "NAME", "MTU", "VERSION");
+    std::printf("\n════════════════════════════════════════════════════════\n");
+    std::printf("  Scanning for Diretta Targets...\n");
+    std::printf("════════════════════════════════════════════════════════\n\n");
+    std::printf("Available Diretta Targets (%zu found):\n\n", targets.size());
+
     for (size_t i = 0; i < targets.size(); ++i) {
         const auto& t = targets[i];
-        std::string addr = ip_to_str(t.portAddr);
-        std::string name = t.info.targetName.empty() ? t.info.outputName : t.info.targetName;
-        if (name.empty()) name = "<unnamed>";
+        const std::string addr = ip_to_str(t.portAddr);
+        const std::string targetName = t.info.targetName.empty()
+            ? (t.info.outputName.empty() ? "<unnamed>" : t.info.outputName)
+            : t.info.targetName;
+        const std::string& outputName = t.info.outputName;
 
         uint32_t mtu = 0;
         finder.measSendMTU(t.portAddr, mtu);
 
-        std::printf("%-5zu %-46s %-32s %-8u %u\n",
-                    i + 1, addr.c_str(), name.c_str(), mtu, t.info.version);
+        std::printf("[%zu] %s\n", i + 1, targetName.c_str());
+        if (!outputName.empty() && outputName != targetName) {
+            std::printf("    Output: %s\n", outputName.c_str());
+        }
+        std::printf("    Address: %s", addr.c_str());
+        if (mtu > 0) {
+            std::printf("  MTU: %u", mtu);
+        }
+        std::printf("\n");
+        std::printf("    Port: IN=%u OUT=%u",
+                    static_cast<unsigned>(t.info.PI),
+                    static_cast<unsigned>(t.info.PO));
+        if (t.info.multiport) {
+            std::printf(" (multiport)");
+        }
+        std::printf("\n");
+        std::printf("    Version: %u\n",
+                    static_cast<unsigned>(t.info.version));
+        std::printf("    ProductID: 0x%016llX\n",
+                    static_cast<unsigned long long>(t.info.productID));
+        if (i + 1 < targets.size()) {
+            std::printf("\n");
+        }
     }
+
+    const char *bin = progname && progname[0] ? progname : "scream2diretta";
+    std::printf("\nUsage:\n");
+    for (size_t i = 0; i < targets.size(); ++i) {
+        std::printf("   Target #%zu: sudo %s --target %zu\n",
+                    i + 1, bin, i + 1);
+    }
+    std::printf("\n");
+
     finder.close();
     return 0;
 }
@@ -2981,6 +3050,39 @@ extern "C" int diretta_output_init(const diretta_config_t *cfg) {
             g_st.cfg.startup_mute_ms);
     }
 
+#ifdef SCREAM2DIRETTA_NO_DIAGNOSTICS
+    // Production binary: diagnostic facilities are compile-time disabled.
+    // Warn the user once if any flag was requested, then null out the
+    // cfg fields so the diagnostic init calls below produce inert dumpers
+    // / disabled analysers without further special-casing. Every per-packet
+    // call site that touches these is gated by diretta_diag_armed(), which
+    // folds to constant 0 here and is DCE'd at the call site.
+    {
+        const bool any_diag_requested =
+            (g_st.cfg.dump_ingress_prefix && g_st.cfg.dump_ingress_prefix[0]) ||
+            (g_st.cfg.dump_egress_prefix && g_st.cfg.dump_egress_prefix[0]) ||
+            (g_st.cfg.dump_raw_entry_prefix && g_st.cfg.dump_raw_entry_prefix[0]) ||
+            (g_st.cfg.startup_analyze_ms > 0) ||
+            (g_st.cfg.startup_fade_ms > 0) ||
+            (g_st.cfg.compare_ingress_taps_ms > 0);
+        if (any_diag_requested) {
+            std::fprintf(stderr,
+                "[diretta] warning: diagnostics not compiled into this "
+                "binary (SCREAM2DIRETTA_NO_DIAGNOSTICS). "
+                "--dump-ingress-wav / --dump-egress-wav / "
+                "--dump-raw-entry-wav / --startup-analyze-ms / "
+                "--startup-fade-ms / --compare-ingress-taps-ms are inert. "
+                "Rebuild as scream2diretta-debug to enable them.\n");
+        }
+        g_st.cfg.dump_ingress_prefix = nullptr;
+        g_st.cfg.dump_egress_prefix = nullptr;
+        g_st.cfg.dump_raw_entry_prefix = nullptr;
+        g_st.cfg.startup_analyze_ms = 0;
+        g_st.cfg.startup_fade_ms = 0;
+        g_st.cfg.compare_ingress_taps_ms = 0;
+    }
+#endif
+
     // PCM dump diagnostics. Files open lazily when the first PCM with a known
     // format arrives.
     pcm_dumper_init(&g_st.ingress_dumper,
@@ -3061,6 +3163,32 @@ extern "C" int diretta_output_init(const diretta_config_t *cfg) {
             (g_st.cfg.startup_fade_shape == 1) ? "cosine" : "linear");
     }
 
+    // Compute the single-point Diretta-diag armed gate. All inputs are
+    // finalised at this point. The gate is consulted by queue_push_frames(),
+    // the raw-entry tap in diretta_output_send(), and the egress-side feeds
+    // in ScreamDirettaSync::getNewStream(). In SCREAM2DIRETTA_NO_DIAGNOSTICS
+    // builds the accessor folds to constant 0 and every guarded block is
+    // dead-code-eliminated, so the per-packet hot path costs zero
+    // instructions for these diagnostics. (The flag symbol itself is also
+    // not defined in that build; see diretta_diag.h.)
+#ifndef SCREAM2DIRETTA_NO_DIAGNOSTICS
+    g_diretta_diag_armed_flag =
+        (pcm_dumper_enabled(&g_st.ingress_dumper) ||
+         pcm_dumper_enabled(&g_st.egress_dumper) ||
+         pcm_dumper_enabled(&g_st.raw_entry_dumper) ||
+         g_st.cfg.startup_analyze_ms > 0 ||
+         g_st.cfg.startup_fade_ms > 0 ||
+         g_st.cfg.compare_ingress_taps_ms > 0) ? 1 : 0;
+    DLOG(1, "diretta-diag gate: armed=%d (ingress_dump=%d egress_dump=%d "
+         "raw_entry_dump=%d analyze_ms=%d fade_ms=%d compare_ms=%d)",
+         g_diretta_diag_armed_flag,
+         pcm_dumper_enabled(&g_st.ingress_dumper),
+         pcm_dumper_enabled(&g_st.egress_dumper),
+         pcm_dumper_enabled(&g_st.raw_entry_dumper),
+         g_st.cfg.startup_analyze_ms, g_st.cfg.startup_fade_ms,
+         g_st.cfg.compare_ingress_taps_ms);
+#endif
+
     g_st.sdk_open = true;
     g_st.initialized = true;
     stats_arm(true);
@@ -3098,7 +3226,13 @@ extern "C" int diretta_output_send(receiver_data_t *data) {
     // frame carry buffer has been combined with any tail from the
     // previous packet, so the byte sequence at the head of a track may
     // appear shifted by up to (bytes_per_frame - 1) bytes vs stdout).
-    if (data->audio != nullptr && data->audio_size > 0) {
+    //
+    // Fast-path: skip even the wire-format decode when neither the
+    // Diretta-internal diagnostic suite nor the backend-independent
+    // receiver-tap is armed. In SCREAM2DIRETTA_NO_DIAGNOSTICS builds
+    // both gates fold to constant 0 and the entire block is DCE'd.
+    if (data->audio != nullptr && data->audio_size > 0 &&
+        (diretta_diag_armed() || receiver_tap_any_armed())) {
         // Resolve the active source format from the wire bytes. This is
         // independent of whether reconfigure() has run for this packet
         // -- the raw-entry tap MUST mirror stdout, which writes regardless

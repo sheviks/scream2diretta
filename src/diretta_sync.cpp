@@ -5,6 +5,7 @@
 // whether each getNewStream cycle outputs silence or pops from the ring.
 
 #include "diretta_sync.h"
+#include "diretta_diag.h"
 
 #include <Diretta/Sync>
 #include <Diretta/Stream>
@@ -389,24 +390,31 @@ bool ScreamDirettaSync::getNewStream(diretta_stream& s) {
         m_ring->popOrSilence(dest, want);
         if (avail_before > 0) {
             m_poppedBytes.fetch_add(avail_before, std::memory_order_relaxed);
-            //  feed the egress analyser (real PCM only). Runs BEFORE
-            // any fade so the analyser observes raw queue contents.
-            if (m_egress_analyzer && !pcm_startup_analyzer_done(m_egress_analyzer)) {
-                pcm_startup_analyzer_feed(m_egress_analyzer, dest, avail_before);
-            }
-            //  apply the egress fade IN PLACE before dumping, so the
-            // egress WAV reflects what the SDK actually receives.
-            if (m_egress_fader && !pcm_startup_fader_done(m_egress_fader)) {
-                pcm_startup_fader_apply(m_egress_fader, dest, avail_before);
-            }
-            //  dump only the bytes that were actually real PCM (the
-            // part popOrSilence padded with silence at the tail does not
-            // count as egress real PCM).
-            if (m_egress_dumper && pcm_dumper_enabled(m_egress_dumper)) {
-                if (pcm_dumper_open_or_rotate(m_egress_dumper,
-                                              m_egress_rate, m_egress_channels,
-                                              m_egress_bits)) {
-                    pcm_dumper_write(m_egress_dumper, dest, avail_before);
+            // Egress diagnostics: analyser, fader, dumper. All three are
+            // gated by the single diretta_diag_armed() flag. In
+            // SCREAM2DIRETTA_NO_DIAGNOSTICS builds the accessor folds to
+            // constant 0 and the entire block is DCE'd, so the SDK send
+            // thread sees zero diagnostic instructions per cycle.
+            if (__builtin_expect(diretta_diag_armed(), 0)) {
+                //  feed the egress analyser (real PCM only). Runs BEFORE
+                // any fade so the analyser observes raw queue contents.
+                if (m_egress_analyzer && !pcm_startup_analyzer_done(m_egress_analyzer)) {
+                    pcm_startup_analyzer_feed(m_egress_analyzer, dest, avail_before);
+                }
+                //  apply the egress fade IN PLACE before dumping, so the
+                // egress WAV reflects what the SDK actually receives.
+                if (m_egress_fader && !pcm_startup_fader_done(m_egress_fader)) {
+                    pcm_startup_fader_apply(m_egress_fader, dest, avail_before);
+                }
+                //  dump only the bytes that were actually real PCM (the
+                // part popOrSilence padded with silence at the tail does not
+                // count as egress real PCM).
+                if (m_egress_dumper && pcm_dumper_enabled(m_egress_dumper)) {
+                    if (pcm_dumper_open_or_rotate(m_egress_dumper,
+                                                  m_egress_rate, m_egress_channels,
+                                                  m_egress_bits)) {
+                        pcm_dumper_write(m_egress_dumper, dest, avail_before);
+                    }
                 }
             }
         }
@@ -417,22 +425,26 @@ bool ScreamDirettaSync::getNewStream(diretta_stream& s) {
     m_ring->popOrSilence(dest, want);
     m_poppedBytes.fetch_add(want, std::memory_order_relaxed);
     m_realCycles.fetch_add(1, std::memory_order_relaxed);
-    //  feed the egress analyser BEFORE the fade so we see raw queue
-    // contents, then apply the fade IN PLACE so dump + SDK see post-fade.
-    if (m_egress_analyzer && !pcm_startup_analyzer_done(m_egress_analyzer)) {
-        pcm_startup_analyzer_feed(m_egress_analyzer, dest, want);
-    }
-    if (m_egress_fader && !pcm_startup_fader_done(m_egress_fader)) {
-        pcm_startup_fader_apply(m_egress_fader, dest, want);
-    }
-    //  dump the full cycle as real egress PCM. We reached this branch
-    // only when ring->available() >= want, so the bytes are guaranteed
-    // real.
-    if (m_egress_dumper && pcm_dumper_enabled(m_egress_dumper)) {
-        if (pcm_dumper_open_or_rotate(m_egress_dumper,
-                                      m_egress_rate, m_egress_channels,
-                                      m_egress_bits)) {
-            pcm_dumper_write(m_egress_dumper, dest, want);
+    // Egress diagnostics: analyser, fader, dumper. Same single-point
+    // gate as the rebuffering branch above; DCE'd in NO_DIAGNOSTICS.
+    if (__builtin_expect(diretta_diag_armed(), 0)) {
+        //  feed the egress analyser BEFORE the fade so we see raw queue
+        // contents, then apply the fade IN PLACE so dump + SDK see post-fade.
+        if (m_egress_analyzer && !pcm_startup_analyzer_done(m_egress_analyzer)) {
+            pcm_startup_analyzer_feed(m_egress_analyzer, dest, want);
+        }
+        if (m_egress_fader && !pcm_startup_fader_done(m_egress_fader)) {
+            pcm_startup_fader_apply(m_egress_fader, dest, want);
+        }
+        //  dump the full cycle as real egress PCM. We reached this branch
+        // only when ring->available() >= want, so the bytes are guaranteed
+        // real.
+        if (m_egress_dumper && pcm_dumper_enabled(m_egress_dumper)) {
+            if (pcm_dumper_open_or_rotate(m_egress_dumper,
+                                          m_egress_rate, m_egress_channels,
+                                          m_egress_bits)) {
+                pcm_dumper_write(m_egress_dumper, dest, want);
+            }
         }
     }
     return true;
