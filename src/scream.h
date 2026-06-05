@@ -23,6 +23,10 @@ typedef struct receiver_data {
   receiver_format_t format;
   unsigned int audio_size;
   unsigned char* audio;
+  /* NIC arrival timestamp in CLOCK_REALTIME nanoseconds, captured by
+   * the kernel via SO_TIMESTAMPNS when --enable-nic-timestamp is set.
+   * 0 means "unavailable" (option off, or kernel did not provide one). */
+  uint64_t nic_timestamp_ns;
 } receiver_data_t;
 
 extern int verbosity;

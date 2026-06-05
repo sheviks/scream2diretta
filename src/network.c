@@ -3,12 +3,15 @@
 
 #include <errno.h>
 #include <sys/select.h>
+#include <sys/time.h>
+#include <time.h>
 
 static rctx_network_t rctx_network;
 
 int init_network(enum receiver_type receiver_mode, in_addr_t interface, int port,
                  char* multicast_group, int udp_rcvbuf_bytes,
-                 const char* allowed_source_ip)
+                 const char* allowed_source_ip,
+                 int udp_busy_poll_us, int enable_nic_timestamp)
 {
   rctx_network.sockfd = socket(AF_INET, SOCK_DGRAM, 0);
   if (rctx_network.sockfd < 0) {
@@ -36,6 +39,82 @@ int init_network(enum receiver_type receiver_mode, in_addr_t interface, int port
                 "(kernel may double the requested value)\n", requested, got);
       }
     }
+  }
+
+  /* SO_BUSY_POLL: ask the kernel to busy-poll the NIC RX queue from the
+   * receiving syscall before sleeping. Eliminates scheduler wakeup
+   * latency at the cost of one core spinning. Only safe on isolated
+   * cores or when the user has dedicated CPU budget. Optional and
+   * off by default; the value is the maximum poll window in
+   * microseconds (typical: 50..100). */
+  if (udp_busy_poll_us > 0) {
+#ifdef SO_BUSY_POLL
+    int v = udp_busy_poll_us;
+    if (setsockopt(rctx_network.sockfd, SOL_SOCKET, SO_BUSY_POLL,
+                   &v, sizeof(v)) != 0) {
+      /* EPERM is the common case: requires CAP_NET_ADMIN.  We do not
+       * fail init -- the receiver works without busy-poll, just with
+       * normal scheduler wakeup behaviour. */
+      fprintf(stderr, "[scream2diretta] WARNING: setsockopt(SO_BUSY_POLL=%d) "
+              "failed: %s. Continuing without busy-poll. Hint: needs "
+              "CAP_NET_ADMIN; run as root or grant the capability.\n",
+              v, strerror(errno));
+    } else if (verbosity) {
+      int got = 0;
+      socklen_t glen = sizeof(got);
+      if (getsockopt(rctx_network.sockfd, SOL_SOCKET, SO_BUSY_POLL,
+                     &got, &glen) == 0) {
+        fprintf(stderr, "[scream2diretta] SO_BUSY_POLL requested=%d effective=%d us\n",
+                v, got);
+      }
+    }
+#ifdef SO_PREFER_BUSY_POLL
+    /* Linux 5.11+: prefer busy-poll over softirq processing on this
+     * socket so the polling thread fully drives the rx path. Best-
+     * effort; failure (older kernels) is silent at default verbosity. */
+    int prefer = 1;
+    if (setsockopt(rctx_network.sockfd, SOL_SOCKET, SO_PREFER_BUSY_POLL,
+                   &prefer, sizeof(prefer)) != 0) {
+      if (verbosity) {
+        fprintf(stderr, "[scream2diretta] SO_PREFER_BUSY_POLL not available: %s\n",
+                strerror(errno));
+      }
+    } else if (verbosity) {
+      fprintf(stderr, "[scream2diretta] SO_PREFER_BUSY_POLL enabled\n");
+    }
+#endif
+#else
+    fprintf(stderr, "[scream2diretta] WARNING: SO_BUSY_POLL not supported "
+            "by this kernel header; --udp-busy-poll-us=%d ignored.\n",
+            udp_busy_poll_us);
+#endif
+  }
+
+  /* SO_TIMESTAMPNS: ask the kernel to attach a CLOCK_REALTIME nanosecond
+   * timestamp (taken at sk_buff arrival, i.e. NIC -> kernel handoff) to
+   * each datagram via SCM_TIMESTAMPNS in the cmsg ancillary buffer.
+   * Lets stats distinguish upstream sender gaps from local userspace
+   * wakeup jitter. Costs a few ns per packet for the cmsg copy. */
+  rctx_network.nic_timestamp_enabled = 0;
+  if (enable_nic_timestamp) {
+#ifdef SO_TIMESTAMPNS
+    int on = 1;
+    if (setsockopt(rctx_network.sockfd, SOL_SOCKET, SO_TIMESTAMPNS,
+                   &on, sizeof(on)) != 0) {
+      fprintf(stderr, "[scream2diretta] WARNING: setsockopt(SO_TIMESTAMPNS) "
+              "failed: %s. Continuing without NIC timestamps.\n",
+              strerror(errno));
+    } else {
+      rctx_network.nic_timestamp_enabled = 1;
+      if (verbosity) {
+        fprintf(stderr, "[scream2diretta] SO_TIMESTAMPNS enabled "
+                "(nic_gap_ms available in stats)\n");
+      }
+    }
+#else
+    fprintf(stderr, "[scream2diretta] WARNING: SO_TIMESTAMPNS not supported "
+            "by this kernel header; --enable-nic-timestamp ignored.\n");
+#endif
   }
 
   rctx_network.allowed_addr_set = 0;
@@ -82,6 +161,7 @@ void rcv_network(receiver_data_t* receiver_data)
   ssize_t n = 0;
   receiver_data->audio_size = 0;
   receiver_data->audio = NULL;
+  receiver_data->nic_timestamp_ns = 0;
 
   // Use select() with a 500ms timeout so the receiver loop can observe a
   // pending shutdown even if no audio packets are flowing. recvfrom() with
@@ -109,10 +189,34 @@ void rcv_network(receiver_data_t* receiver_data)
       return;
     }
 
+    /* recvmsg path: lets us read SCM_TIMESTAMPNS out of the cmsg buffer
+     * when --enable-nic-timestamp is in effect. The shape is identical
+     * to the previous recvfrom() in everything else; the cmsg parse is
+     * a few ns and is skipped entirely when nic_timestamp_enabled is
+     * zero. */
     struct sockaddr_in sender;
-    socklen_t sender_len = sizeof(sender);
-    n = recvfrom(rctx_network.sockfd, rctx_network.buf, MAX_SO_PACKETSIZE, 0,
-                 (struct sockaddr *)&sender, &sender_len);
+    struct iovec iov;
+    iov.iov_base = rctx_network.buf;
+    iov.iov_len  = MAX_SO_PACKETSIZE;
+
+    /* Cmsg buffer sized for SCM_TIMESTAMPNS (struct timespec).
+     * CMSG_SPACE handles alignment + header overhead. */
+    union {
+      char buf[CMSG_SPACE(sizeof(struct timespec))];
+      struct cmsghdr align;
+    } cmsg_buf;
+
+    struct msghdr msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_name       = &sender;
+    msg.msg_namelen    = sizeof(sender);
+    msg.msg_iov        = &iov;
+    msg.msg_iovlen     = 1;
+    msg.msg_control    = cmsg_buf.buf;
+    msg.msg_controllen = sizeof(cmsg_buf.buf);
+    msg.msg_flags      = 0;
+
+    n = recvmsg(rctx_network.sockfd, &msg, 0);
     if (n < 0) {
       if (errno == EINTR) return;
       continue;
@@ -120,8 +224,35 @@ void rcv_network(receiver_data_t* receiver_data)
     if (rctx_network.allowed_addr_set) {
       if (sender.sin_addr.s_addr != rctx_network.allowed_addr.sin_addr.s_addr) {
         // Silently drop packet from non-allowed source.
+        n = 0;
         continue;
       }
+    }
+
+    /* Extract NIC timestamp if requested and present. SCM_TIMESTAMPNS
+     * carries struct timespec captured by the kernel at sk_buff arrival;
+     * we serialise it as a single uint64_t nanoseconds since the
+     * CLOCK_REALTIME epoch, which is what diretta.cpp consumes. A zero
+     * value means "unavailable" -- propagate that semantics. */
+    if (rctx_network.nic_timestamp_enabled) {
+#ifdef SCM_TIMESTAMPNS
+      for (struct cmsghdr* c = CMSG_FIRSTHDR(&msg); c != NULL;
+           c = CMSG_NXTHDR(&msg, c)) {
+        if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_TIMESTAMPNS) {
+          struct timespec ts;
+          memcpy(&ts, CMSG_DATA(c), sizeof(ts));
+          uint64_t ns = (uint64_t)ts.tv_sec * 1000000000ULL +
+                        (uint64_t)ts.tv_nsec;
+          /* Avoid 0 collision with "unavailable" sentinel; if the
+           * kernel ever yielded a literal 0 timespec we round it up
+           * to 1 ns. In practice CLOCK_REALTIME is far past the
+           * epoch, so this branch is dead code on a sane system. */
+          if (ns == 0) ns = 1;
+          receiver_data->nic_timestamp_ns = ns;
+          break;
+        }
+      }
+#endif
     }
   }
   receiver_data->format.sample_rate = rctx_network.buf[0];

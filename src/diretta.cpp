@@ -268,6 +268,13 @@ struct DirettaState {
     std::chrono::steady_clock::time_point last_pcm_packet_at{};
     bool have_last_pcm_packet_at = false;
 
+    // NIC-arrival timestamp of the most recent PCM packet, in CLOCK_REALTIME
+    // nanoseconds (set only when --enable-nic-timestamp is in effect).
+    // Lets underrun_begin/recover separate upstream sender gaps (nic_gap_ms)
+    // from local userspace wakeup latency (source_gap_ms - nic_gap_ms).
+    // 0 = unavailable.
+    uint64_t last_pcm_nic_ts_ns = 0;
+
     // Previous underrun-event count observed by the receive thread when it
     // last polled. We use this to detect "underrun begin" without racing
     // against the SDK thread: when current > previous we emit the begin
@@ -2457,6 +2464,24 @@ static void poll_underrun_events() {
             source_gap_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 now - g_st.last_pcm_packet_at).count();
         }
+        // nic_gap_ms: time since the kernel timestamped the last PCM
+        // packet at NIC arrival (SO_TIMESTAMPNS). Compared against
+        // source_gap_ms it isolates upstream sender silence from local
+        // wakeup latency: large nic_gap with similar source_gap means
+        // the source went quiet; large source_gap with small nic_gap
+        // means the kernel got the packet but our wakeup was late.
+        // -1 = NIC timestamping disabled or no packet seen yet.
+        long long nic_gap_ms = -1;
+        if (g_st.last_pcm_nic_ts_ns != 0) {
+            struct timespec now_rt;
+            if (clock_gettime(CLOCK_REALTIME, &now_rt) == 0) {
+                uint64_t now_ns = (uint64_t)now_rt.tv_sec * 1000000000ULL +
+                                  (uint64_t)now_rt.tv_nsec;
+                if (now_ns >= g_st.last_pcm_nic_ts_ns) {
+                    nic_gap_ms = (long long)((now_ns - g_st.last_pcm_nic_ts_ns) / 1000000ULL);
+                }
+            }
+        }
         const size_t rebuf_target = g_st.sync->rebufferTargetBytes();
         uint64_t rebuf_target_ms = 0;
         if (bps > 0) rebuf_target_ms = (static_cast<uint64_t>(rebuf_target) * 1000ULL) / bps;
@@ -2464,7 +2489,7 @@ static void poll_underrun_events() {
 
         std::fprintf(stderr,
             "[diretta] underrun_begin: episode=%llu fill=%zu/%zu B "
-            "(~%llu/%llu ms) source_gap_ms=%lld producer=%s "
+            "(~%llu/%llu ms) source_gap_ms=%lld nic_gap_ms=%lld producer=%s "
             "stream_count=%llu real_cycles=%llu silent_cycles=%llu "
             "rebuffer_target=%zu B (~%llu ms)\n",
             (unsigned long long)cur_events,
@@ -2472,6 +2497,7 @@ static void poll_underrun_events() {
             (unsigned long long)fill_ms,
             (unsigned long long)cap_ms,
             source_gap_ms,
+            nic_gap_ms,
             producer_active ? "active" : "idle",
             (unsigned long long)g_st.sync->getStreamCount(),
             (unsigned long long)g_st.underrun_begin_real_cycles,
@@ -2479,10 +2505,11 @@ static void poll_underrun_events() {
             rebuf_target, (unsigned long long)rebuf_target_ms);
         phase_event("underrun_begin",
                     "episode=%llu fill_ms=%llu source_gap_ms=%lld "
-                    "producer=%s rebuffer_target_ms=%llu",
+                    "nic_gap_ms=%lld producer=%s rebuffer_target_ms=%llu",
                     (unsigned long long)cur_events,
                     (unsigned long long)fill_ms,
                     source_gap_ms,
+                    nic_gap_ms,
                     producer_active ? "active" : "idle",
                     (unsigned long long)rebuf_target_ms);
     }
@@ -2500,25 +2527,37 @@ static void poll_underrun_events() {
             source_gap_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 now - g_st.last_pcm_packet_at).count();
         }
+        long long nic_gap_ms = -1;
+        if (g_st.last_pcm_nic_ts_ns != 0) {
+            struct timespec now_rt;
+            if (clock_gettime(CLOCK_REALTIME, &now_rt) == 0) {
+                uint64_t now_ns = (uint64_t)now_rt.tv_sec * 1000000000ULL +
+                                  (uint64_t)now_rt.tv_nsec;
+                if (now_ns >= g_st.last_pcm_nic_ts_ns) {
+                    nic_gap_ms = (long long)((now_ns - g_st.last_pcm_nic_ts_ns) / 1000000ULL);
+                }
+            }
+        }
         const uint64_t silent_delta = g_st.sync->silentCycles() -
                                        g_st.underrun_begin_silent_cycles;
         const uint64_t real_delta   = g_st.sync->realCycles() -
                                        g_st.underrun_begin_real_cycles;
         std::fprintf(stderr,
             "[diretta] underrun_recover: episode=%llu fill=%zu B "
-            "(~%llu ms) silent_ms=%lld source_gap_ms=%lld producer=%s "
-            "silent_cycles_delta=%llu real_cycles_delta=%llu\n",
+            "(~%llu ms) silent_ms=%lld source_gap_ms=%lld nic_gap_ms=%lld "
+            "producer=%s silent_cycles_delta=%llu real_cycles_delta=%llu\n",
             (unsigned long long)cur_events,
             fill, (unsigned long long)fill_ms,
-            silent_ms, source_gap_ms,
+            silent_ms, source_gap_ms, nic_gap_ms,
             g_st.was_active_last_period ? "active" : "idle",
             (unsigned long long)silent_delta,
             (unsigned long long)real_delta);
         phase_event("underrun_recover",
-                    "episode=%llu fill_ms=%llu silent_ms=%lld source_gap_ms=%lld",
+                    "episode=%llu fill_ms=%llu silent_ms=%lld "
+                    "source_gap_ms=%lld nic_gap_ms=%lld",
                     (unsigned long long)cur_events,
                     (unsigned long long)fill_ms,
-                    silent_ms, source_gap_ms);
+                    silent_ms, source_gap_ms, nic_gap_ms);
     }
 }
 
@@ -3224,6 +3263,12 @@ extern "C" int diretta_output_send(receiver_data_t *data) {
     if (data->audio != nullptr && data->audio_size > 0) {
         g_st.last_pcm_packet_at = std::chrono::steady_clock::now();
         g_st.have_last_pcm_packet_at = true;
+        // NIC-arrival timestamp populated by network.c when SO_TIMESTAMPNS
+        // is enabled. 0 means "unavailable" -- preserve that semantics so
+        // underrun lines can omit nic_gap_ms cleanly.
+        if (data->nic_timestamp_ns != 0) {
+            g_st.last_pcm_nic_ts_ns = data->nic_timestamp_ns;
+        }
     }
 
     // Raw-entry tap. Captures data->audio raw, BEFORE any

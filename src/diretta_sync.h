@@ -246,6 +246,17 @@ private:
     std::atomic<bool> m_prefillDone{false};
     std::atomic<bool> m_rebuffering{false};
 
+    // Fast-path flag. Once all four startup gates (mute / prefill /
+    // real_delay / rebuffer-clear) have passed at least once and a
+    // normal real-PCM pop has succeeded, getNewStream() flips this
+    // to true and subsequent cycles take a single-load fast path
+    // that skips the gate cascade. Gate 3 (underrun) clears it so
+    // the slow path can arm rebuffering. resetGate() clears it on
+    // every reconfigure. Acquire/release pairs with the gate stores
+    // so a reader observing m_steadyState==true also observes all
+    // prior gate transitions.
+    std::atomic<bool> m_steadyState{false};
+
     // Startup mute gate. m_muteBytes is the silent-warmup target in
     // bytes (computed from sample rate and the configured ms). The mute
     // gate sits BEFORE the prefill gate: until m_muteDone is true, every

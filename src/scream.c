@@ -105,6 +105,15 @@ static void show_usage(const char *arg0)
   fprintf(stderr, "  --udp-rcvbuf-bytes <bytes>   Kernel SO_RCVBUF size on the UDP socket\n");
   fprintf(stderr, "                               (default 4194304 = 4 MiB for Diretta;\n");
   fprintf(stderr, "                               0 = leave kernel default).\n");
+  fprintf(stderr, "  --udp-busy-poll-us <us>      SO_BUSY_POLL window in microseconds. The receiver\n");
+  fprintf(stderr, "                               thread polls the NIC RX queue for up to <us> before\n");
+  fprintf(stderr, "                               giving up and sleeping. Trades CPU for wakeup-jitter\n");
+  fprintf(stderr, "                               removal; safe on isolated cores. 0 = off (default).\n");
+  fprintf(stderr, "                               Recommended: 50..100 on isolated RT systems.\n");
+  fprintf(stderr, "  --enable-nic-timestamp       Request SO_TIMESTAMPNS on the UDP socket. Captures\n");
+  fprintf(stderr, "                               the NIC arrival time of each packet so stats can\n");
+  fprintf(stderr, "                               distinguish upstream gaps from local wakeup jitter\n");
+  fprintf(stderr, "                               (logged as nic_gap_ms alongside source_gap_ms).\n");
   fprintf(stderr, "  --allowed-source-ip <ip>     Only accept Scream packets from this source\n");
   fprintf(stderr, "                               IPv4 address. Drops all other senders.\n");
   fprintf(stderr, "\n");
@@ -154,6 +163,12 @@ static void show_usage(const char *arg0)
   fprintf(stderr, "  --cpu-other <core>           Pin Diretta SDK helper threads to <core>.\n");
   fprintf(stderr, "  --rt-priority <1-99>         SCHED_FIFO real-time priority for the receiver\n");
   fprintf(stderr, "                               and Diretta SDK worker threads. -1=disabled (default).\n");
+  fprintf(stderr, "  --no-mlock                   Disable mlockall(MCL_CURRENT|MCL_FUTURE). By default\n");
+  fprintf(stderr, "                               the receiver pins all current and future pages in\n");
+  fprintf(stderr, "                               RAM so the kernel cannot page out the PCM ring or\n");
+  fprintf(stderr, "                               SDK buffers under memory pressure. Requires\n");
+  fprintf(stderr, "                               sufficient RLIMIT_MEMLOCK (root or systemd\n");
+  fprintf(stderr, "                               LimitMEMLOCK=infinity); failure is non-fatal.\n");
   fprintf(stderr, "\n");
   fprintf(stderr, "Stats:\n");
   fprintf(stderr, "  --stats-interval <sec>       Periodic producer-side stats every <sec> seconds (default 0=off).\n");
@@ -265,11 +280,14 @@ enum {
   OPT_DSD_PREFILL_MS,
   OPT_DSD_STARTUP_WARMUP_MS,
   OPT_UDP_RCVBUF_BYTES,
+  OPT_UDP_BUSY_POLL_US,
+  OPT_ENABLE_NIC_TIMESTAMP,
   OPT_ALLOWED_SOURCE_IP,
   OPT_CPU_SCREAM,
   OPT_CPU_AUDIO,
   OPT_CPU_OTHER,
   OPT_RT_PRIORITY,
+  OPT_NO_MLOCK,
   OPT_VERSION,
 };
 
@@ -320,11 +338,14 @@ static const struct option long_options[] = {
   { "dsd-prefill-ms",            required_argument, 0, OPT_DSD_PREFILL_MS },
   { "dsd-startup-warmup-ms",     required_argument, 0, OPT_DSD_STARTUP_WARMUP_MS },
   { "udp-rcvbuf-bytes",          required_argument, 0, OPT_UDP_RCVBUF_BYTES },
+  { "udp-busy-poll-us",          required_argument, 0, OPT_UDP_BUSY_POLL_US },
+  { "enable-nic-timestamp",      no_argument,       0, OPT_ENABLE_NIC_TIMESTAMP },
   { "allowed-source-ip",         required_argument, 0, OPT_ALLOWED_SOURCE_IP },
   { "cpu-scream",                required_argument, 0, OPT_CPU_SCREAM },
   { "cpu-audio",                 required_argument, 0, OPT_CPU_AUDIO },
   { "cpu-other",                 required_argument, 0, OPT_CPU_OTHER },
   { "rt-priority",               required_argument, 0, OPT_RT_PRIORITY },
+  { "no-mlock",                  no_argument,       0, OPT_NO_MLOCK },
   { 0, 0, 0, 0 }
 };
 
@@ -404,6 +425,9 @@ int main(int argc, char*argv[]) {
    * output is Diretta; the user can override or disable (0) explicitly. */
   int   udp_rcvbuf_bytes      = 0;
   int   udp_rcvbuf_user_set   = 0;
+  int   udp_busy_poll_us      = 0;   /* SO_BUSY_POLL window (us). 0 = off. */
+  int   enable_nic_timestamp  = 0;   /* SO_TIMESTAMPNS on the UDP socket. */
+  int   memlock_enabled       = 1;   /* mlockall(MCL_CURRENT|MCL_FUTURE); --no-mlock to disable. */
   char *allowed_source_ip     = NULL;
 
 #if DIRETTA_ENABLE
@@ -610,6 +634,18 @@ int main(int argc, char*argv[]) {
       udp_rcvbuf_user_set = 1;
       break;
     }
+    case OPT_UDP_BUSY_POLL_US: {
+      int v = atoi(optarg);
+      if (v < 0 || v > 1000000) {
+        fprintf(stderr, "--udp-busy-poll-us must be 0..1000000\n");
+        return 1;
+      }
+      udp_busy_poll_us = v;
+      break;
+    }
+    case OPT_ENABLE_NIC_TIMESTAMP:
+      enable_nic_timestamp = 1;
+      break;
     case OPT_ALLOWED_SOURCE_IP:
       allowed_source_ip = strdup(optarg);
       break;
@@ -649,6 +685,9 @@ int main(int argc, char*argv[]) {
       dcfg.rt_priority = v;
       break;
     }
+    case OPT_NO_MLOCK:
+      memlock_enabled = 0;
+      break;
     case OPT_REBUFFER_PERCENT: {
       double pct = atof(optarg);
       if (pct < 0.0 || pct > 95.0) {
@@ -1146,6 +1185,57 @@ int main(int argc, char*argv[]) {
   // the receiver loop within a single select() poll period (~500ms).
   install_term_handlers();
 
+  /* Lock all current and future pages in RAM so the kernel cannot page
+   * out PcmRing / SDK buffers / TLS / stack under memory pressure. A
+   * paged-out hot page would otherwise cause a multi-ms major fault on
+   * the next access, which is enough to underrun the Diretta pull cycle.
+   *
+   * Two-step bring-up:
+   *   1. Try to raise RLIMIT_MEMLOCK to RLIM_INFINITY. Only effective
+   *      when the process has CAP_SYS_RESOURCE (typically root). On
+   *      systemd we expect LimitMEMLOCK=infinity in the unit instead.
+   *   2. Call mlockall(MCL_CURRENT | MCL_FUTURE). MCL_FUTURE is the
+   *      important half: receiver buffers / Diretta SDK allocations
+   *      / pthread stacks created later are also pinned.
+   *
+   * Failure (EPERM, ENOMEM, EAGAIN) is non-fatal: we log a warning and
+   * keep running with default paging behaviour. --no-mlock disables
+   * the call entirely for systems where pinning is undesirable. */
+  if (memlock_enabled) {
+#if defined(__linux__)
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_MEMLOCK, &rl) == 0) {
+      if (rl.rlim_cur != RLIM_INFINITY || rl.rlim_max != RLIM_INFINITY) {
+        struct rlimit want;
+        want.rlim_cur = RLIM_INFINITY;
+        want.rlim_max = RLIM_INFINITY;
+        /* Best effort. If we cannot raise the limit (no
+         * CAP_SYS_RESOURCE), mlockall may still partially succeed up
+         * to the existing limit and pin the most critical pages. */
+        (void)setrlimit(RLIMIT_MEMLOCK, &want);
+      }
+    }
+#endif
+    if (mlockall(MCL_CURRENT | MCL_FUTURE) == 0) {
+      if (verbosity) {
+        fprintf(stderr,
+                "[scream2diretta] mlockall(MCL_CURRENT|MCL_FUTURE) ok: "
+                "current+future pages pinned in RAM\n");
+      }
+    } else {
+      int err = errno;
+      fprintf(stderr,
+              "[scream2diretta] WARNING: mlockall failed (errno=%d %s); "
+              "running without page locking. Pass --no-mlock to silence "
+              "this warning, or grant CAP_IPC_LOCK / "
+              "LimitMEMLOCK=infinity to enable it.\n",
+              err, strerror(err));
+    }
+  } else if (verbosity) {
+    fprintf(stderr,
+            "[scream2diretta] mlockall disabled by --no-mlock\n");
+  }
+
   // initialize receiver
   switch (receiver_mode) {
     case SharedMem:
@@ -1171,7 +1261,8 @@ int main(int argc, char*argv[]) {
     default:
       if (verbosity) fprintf(stderr, "Starting %s receiver\n", receiver_mode == Unicast ? "unicast" : "multicast");
       if (init_network(receiver_mode, interface, port, multicast_group,
-                         udp_rcvbuf_bytes, allowed_source_ip) != 0) {
+                         udp_rcvbuf_bytes, allowed_source_ip,
+                         udp_busy_poll_us, enable_nic_timestamp) != 0) {
         return 1;
       }
       receiver_rcv_fn = rcv_network;
@@ -1183,6 +1274,7 @@ int main(int argc, char*argv[]) {
   while (!g_shutdown_pending) {
     receiver_data.audio_size = 0;
     receiver_data.audio = NULL;
+    receiver_data.nic_timestamp_ns = 0;
     receiver_rcv_fn(&receiver_data);
     if (g_shutdown_pending) break;
     if (receiver_data.audio_size == 0 || receiver_data.audio == NULL) {
