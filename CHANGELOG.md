@@ -8,6 +8,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Performance
+
+- **SO_BUSY_POLL, NIC timestamping, mlockall, and `getNewStream` fast path**.
+  Four related changes to reduce wakeup jitter and gate overhead on the
+  PcmRing → `getNewStream()` hot path:
+  - `--udp-busy-poll-us <us>`: enables `SO_BUSY_POLL` on the Scream UDP socket
+    so the receiver thread spins briefly in-kernel for new packets instead of
+    scheduling out. 0 (default) preserves prior behaviour.
+  - `--enable-nic-timestamp`: enables `SO_TIMESTAMPNS` and threads the per-packet
+    NIC arrival timestamp to the underrun reporter as `nic_gap_ms`, separating
+    upstream sender silence from local userspace wakeup latency.
+  - `--no-mlock`: disable `mlockall(MCL_CURRENT|MCL_FUTURE)` which is now
+    called by default. Pins all current and future pages in RAM so the PCM ring
+    and SDK buffers cannot be paged out under memory pressure. Non-fatal on
+    failure; root or `LimitMEMLOCK=infinity` required.
+  - `getNewStream` fast path + branch hints: once all four startup gates have
+    passed, an atomic `m_steadyState` latches so subsequent SDK pull cycles skip
+    the gate cascade. Gate 3 (underrun) clears the latch with a release store.
+  (`network.c`, `network.h`, `scream.c`, `scream.h`, `diretta.cpp`,
+  `diretta_sync.h`, `diretta_sync.cpp`)
+
+- **Add `CAP_IPC_LOCK` to systemd capabilities**.
+  `AmbientCapabilities` and `CapabilityBoundingSet` now include `CAP_IPC_LOCK`
+  so that `mlockall` works under a future non-root service user. Previously
+  only `CAP_NET_RAW`, `CAP_NET_ADMIN`, and `CAP_SYS_NICE` were declared.
+  (`scripts/scream2diretta.service`)
+
 ---
 
 ## [0.3.0] - 2026-05-30

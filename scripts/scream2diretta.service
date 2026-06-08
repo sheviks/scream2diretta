@@ -25,11 +25,12 @@ LimitMEMLOCK=infinity
 LimitNICE=-20
 
 # Capabilities required when running as non-root:
-#   NET_RAW  - Diretta raw Ethernet frames
+#   NET_RAW   - Diretta raw Ethernet frames
 #   NET_ADMIN - network interface operations
 #   SYS_NICE  - SCHED_FIFO and nice(-10)
-AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN CAP_SYS_NICE
-CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN CAP_SYS_NICE
+#   IPC_LOCK  - mlockall(MCL_CURRENT|MCL_FUTURE) for page pinning
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN CAP_SYS_NICE CAP_IPC_LOCK
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN CAP_SYS_NICE CAP_IPC_LOCK
 NoNewPrivileges=yes
 
 # Persistent state directory for per-target overhead cache

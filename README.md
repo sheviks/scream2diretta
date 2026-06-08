@@ -239,10 +239,13 @@ sudo ./scream2diretta -t 1 -p 4011 \
 | `--pcm-prefill-ms <ms>` | 500 | Fill threshold before first pull |
 | `--rebuffer-percent <pct>` | 50 | Resume threshold after underrun |
 | `--udp-rcvbuf-bytes <bytes>` | 4194304 | Kernel SO_RCVBUF |
+| `--udp-busy-poll-us <us>` | 0 | In-kernel busy-poll window (0 = off) |
+| `--enable-nic-timestamp` | off | Per-packet NIC arrival timestamp for underrun diagnostics |
 | `--cpu-scream <core>` | — | Pin receiver thread to core |
 | `--cpu-audio <core>` | — | Pin SDK worker thread to core (adds OCCUPIED) |
 | `--cpu-other <core>` | — | Pin helper threads to core |
 | `--rt-priority <1-99>` | — | SCHED_FIFO priority for receiver & SDK worker |
+| `--no-mlock` | off | Disable `mlockall` (default pins all pages in RAM) |
 | `--stats --stats-interval <sec>` | off | Periodic stats |
 | `-v` / `-vv` | off | Verbose / very verbose |
 
