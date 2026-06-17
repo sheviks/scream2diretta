@@ -8,7 +8,62 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-### Performance
+---
+
+## [0.4.0] - 2026-06-17
+
+### Summary
+
+Release focused on the `--transfer-mode=auto` + `--cycle-time` combination,
+log accuracy of the `target_cycle` field, and latency-determinism work
+carried over from the c00d2c3 / b85bd60 follow-up. Bundles in the
+SO_BUSY_POLL / NIC timestamping / mlockall / fast-path changes that
+shipped behind `[Unreleased]` since 0.3.0.
+
+### Changed
+
+- **`--transfer-mode=auto` now honours `--cycle-time` when given**.
+  When both flags are present, the user's `cycle_us` is treated as primary
+  intent and applied via `configTransferFixAuto()` (`auto-fixauto`), BUT
+  only if 1 packet/cycle still fits within `effMtu` at the current format.
+  The 1-packet bound is `varmax_cycle = calculateCycleTime(...)` with a 3%
+  safety margin to absorb overhead-inference jitter. If the user cycle
+  exceeds `safe_max`, s2d logs a `[warn]` line and falls back to
+  `configTransferVarMax(varmax_cycle)` (`auto-varmax-override`) so that
+  `cycle_packets` stays at 1. With no `--cycle-time` given, behaviour is
+  unchanged: low-bitrate / DSD → VarAuto, normal/high PCM → VarMax.
+  (`diretta.cpp`)
+
+- **Sanity warning when `--cycle-time` < 200µs**. Below this threshold the
+  target is unlikely to keep up; the warning fires for any transfer mode
+  but the user value is still applied (cycle is not clamped).
+  (`diretta.cpp`)
+
+- **Remove undocumented "dense path" from AUTO branch**. An uncommitted
+  heuristic added in a prior session compressed normal/high-rate PCM to
+  `VarAuto(2000µs)` whenever the natural full-packet cycle exceeded 2000µs.
+  It was never released, never documented, and overlapped with the new
+  `auto + --cycle-time` semantics. AUTO now matches the historical
+  DRUP-style two-branch decision.
+  (`diretta.cpp`)
+
+### Fixed
+
+- **`target_cycle` log / stats no longer disagree with the SDK input**.
+  The caller previously recomputed `target_cycle` with the old
+  `cfg.cycle_us > 0 ? cfg.cycle_us : calculateCycleTime(...)` pattern,
+  which silently lied when the AUTO branch routed the request through an
+  override path (e.g. `auto-varmax-override` sends `varmax_cycle` to the
+  SDK while the caller still showed the user's requested value).
+  `apply_transfer_mode()` now returns the effective cycle via an out
+  parameter; the open-side logging and `g_st.target_cycle_us` (exposed in
+  `diretta_stats_t`) consume that value directly. Verified end-to-end:
+  for DSD256 (352.8k container) with `--cycle-time=800`, log now reports
+  `mode=auto-varmax-override target_cycle=530us sdk_cycle=531us
+  cycle_size=1496B cycle_packets=1` (was `target_cycle=800`).
+  (`diretta.cpp`)
+
+### Performance (carried over from 0.3.x follow-up)
 
 - **SO_BUSY_POLL, NIC timestamping, mlockall, and `getNewStream` fast path**.
   Four related changes to reduce wakeup jitter and gate overhead on the

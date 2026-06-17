@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.7...4.0)
 
-project(scream2diretta VERSION 0.3 LANGUAGES C CXX)
+project(scream2diretta VERSION 0.4 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

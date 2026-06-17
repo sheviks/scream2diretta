@@ -938,20 +938,42 @@ static unsigned int calculateCycleTime(uint32_t sampleRate,
 }
 
 // Returns the human-readable mode name actually applied (for -vv logging).
-static const char* apply_transfer_mode(Sync& sb, const diretta_config_t& cfg) {
-    const unsigned int cycle_us = (cfg.cycle_us > 0)
-        ? cfg.cycle_us
-        : calculateCycleTime(g_st.sample_rate,
-                             g_st.channels,
-                             g_st.bits_per_sample,
-                             cfg.mtu_override > 0
-                                 ? static_cast<uint32_t>(cfg.mtu_override)
-                                 : g_st.mtu,
-                             g_st.inferred_overhead);
+// out_effective_cycle_us receives the cycle value we actually hand to the SDK
+// for this configuration (so callers/logging don't have to second-guess the
+// AUTO branch decision).
+static const char* apply_transfer_mode(Sync& sb,
+                                       const diretta_config_t& cfg,
+                                       unsigned int& out_effective_cycle_us) {
+    const uint32_t effective_mtu = cfg.mtu_override > 0
+        ? static_cast<uint32_t>(cfg.mtu_override)
+        : g_st.mtu;
+    // varmax_cycle = cycle time that exactly fills one effMtu packet at the
+    // current format. Used both as the auto-default cycle and as the
+    // "1 packet per cycle" upper bound when the user gives an explicit cycle.
+    const unsigned int varmax_cycle = calculateCycleTime(g_st.sample_rate,
+                                                         g_st.channels,
+                                                         g_st.bits_per_sample,
+                                                         effective_mtu,
+                                                         g_st.inferred_overhead);
+    const unsigned int cycle_us = (cfg.cycle_us > 0) ? cfg.cycle_us : varmax_cycle;
     const Clock cycle    = Clock::MicroSeconds(cycle_us);
     const Clock cycleMin = (cfg.cycle_min_us > 0)
         ? Clock::MicroSeconds(cfg.cycle_min_us)
         : Clock();
+    // Default: the cycle we computed above is what we hand to the SDK. AUTO
+    // sub-branches that override this (varmax-override) must update
+    // out_effective_cycle_us before returning.
+    out_effective_cycle_us = cycle_us;
+
+    // Global sanity warning: cycle <200us is below typical target capability
+    // and may produce unstable playback. We still honour the user value; in
+    // auto+user-cycle mode it will additionally be checked against varmax_cycle
+    // (1-packet bound) below.
+    if (cfg.cycle_us > 0 && cfg.cycle_us < 200u) {
+        DLOG(0, "[warn] cycle_time_us=%u < 200us is below typical target "
+                "capability; sound may be unstable (format=%uHz/%ubit/%uch)",
+             cfg.cycle_us, g_st.sample_rate, g_st.bits_per_sample, g_st.channels);
+    }
 
     if (cfg.target_profile_limit_us > 0) {
         const Clock limitCycle = Clock::MicroSeconds(cfg.target_profile_limit_us);
@@ -1000,9 +1022,43 @@ static const char* apply_transfer_mode(Sync& sb, const diretta_config_t& cfg) {
             return "random";
         case DIRETTA_TM_AUTO:
         default: {
-            // DRUP-style AUTO logic:
-            // Low-bitrate (≤16-bit / ≤48kHz) or DSD → VarAuto for flexibility.
-            // Normal / high-bitrate PCM → VarMax for throughput.
+            // AUTO logic (two sub-cases):
+            //
+            // A. User explicitly gave --cycle-time (cfg.cycle_us > 0):
+            //    Treat user cycle as primary intent. Apply via FixAuto so the
+            //    cycle is honored verbatim, BUT only if 1 packet still fits
+            //    within effMtu at that cycle. The 1-packet bound is
+            //    varmax_cycle (cycle that exactly fills effMtu). We use a 3%
+            //    safety margin to absorb overhead-inference jitter so we
+            //    don't silently fall to 2 packets/cycle.
+            //      user_cycle <= safe_max  -> FixAuto(user_cycle)
+            //      user_cycle >  safe_max  -> override to VarMax(varmax_cycle)
+            //
+            // B. No --cycle-time (cfg.cycle_us == 0):
+            //    DRUP-style policy: low-bitrate (<=16bit/<=48k) or DSD →
+            //    VarAuto; normal/high-rate PCM → VarMax. The cycle used is
+            //    varmax_cycle (one effMtu worth of data at current format).
+            if (cfg.cycle_us > 0) {
+                const unsigned int safe_max = static_cast<unsigned int>(
+                    static_cast<double>(varmax_cycle) * 0.97);
+                if (cycle_us <= safe_max) {
+                    sb.configTransferFixAuto(cycle);
+                    // out_effective_cycle_us already = cycle_us (= user value)
+                    return "auto-fixauto";
+                } else {
+                    DLOG(0, "[warn] requested cycle_time_us=%u exceeds 1-packet "
+                            "limit (varmax_cycle=%u, safe_max=%u) at "
+                            "%uHz/%ubit/%uch; falling back to varmax",
+                         cycle_us, varmax_cycle, safe_max,
+                         g_st.sample_rate, g_st.bits_per_sample, g_st.channels);
+                    sb.configTransferVarMax(Clock::MicroSeconds(varmax_cycle));
+                    out_effective_cycle_us = varmax_cycle;
+                    return "auto-varmax-override";
+                }
+            }
+            // cfg.cycle_us == 0 path (original auto policy: low-bitrate/DSD →
+            // VarAuto, normal/high-rate PCM → VarMax). out_effective_cycle_us
+            // is already set to cycle_us (=varmax_cycle) at function entry.
             const bool isLowBitrate = (g_st.bits_per_sample <= 16
                                        && g_st.sample_rate <= 48000);
             if (isLowBitrate || g_st.is_dsd) {
@@ -1664,7 +1720,8 @@ static uint32_t open_sync_worker_blocking(scream_diretta::ScreamDirettaSync*& ou
               "mode=%d cycle_us=%d cycle_min_us=%d info_cycle_us=%d profile_limit_us=%d",
               (int)cfg.transfer_mode, cfg.cycle_us, cfg.cycle_min_us,
               cfg.info_cycle_us, cfg.target_profile_limit_us);
-    const char* applied_mode = apply_transfer_mode(*sync, cfg);
+    unsigned int applied_cycle_us = 0;
+    const char* applied_mode = apply_transfer_mode(*sync, cfg, applied_cycle_us);
     if (dbg_on()) {
         dbg_event("sdk_cycle_info",
                   "getCycleTime_us=%lld getMinCycleTime_us=%lld getCycleSize=%zu getCyclePackets=%zu",
@@ -1682,10 +1739,11 @@ static uint32_t open_sync_worker_blocking(scream_diretta::ScreamDirettaSync*& ou
         const uint32_t eff_mtu = cfg.mtu_override > 0
             ? (uint32_t)cfg.mtu_override
             : g_st.mtu;
-        const int target_cycle = cfg.cycle_us > 0 ? cfg.cycle_us
-            : (int)calculateCycleTime(g_st.sample_rate, g_st.channels,
-                                      g_st.bits_per_sample, eff_mtu,
-                                      g_st.inferred_overhead);
+        // target_cycle = the cycle we actually handed to the SDK (returned via
+        // out-param from apply_transfer_mode). This stays correct across all
+        // AUTO sub-branches (varmax-override, fixauto, etc.) where the cycle
+        // handed to SDK may differ from cfg.cycle_us.
+        const int target_cycle = static_cast<int>(applied_cycle_us);
         const long long sdk_cycle = (long long)(sync->getCycleTime().getMicroSeconds());
 
         if (verbosity >= 2) {
