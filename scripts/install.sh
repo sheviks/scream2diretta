@@ -56,23 +56,44 @@ confirm() {
 
 detect_arch_name() {
     local arch=$(uname -m)
+    # Kernel baseline: SDK ships "15" (kernel 5.x baseline) and "16" (kernel 6.x baseline).
+    # Pick "16" when running a 6.x or newer kernel; otherwise "15".
+    local kernel_major=$(uname -r 2>/dev/null | cut -d. -f1)
+    local kbase="15"
+    if [ -n "$kernel_major" ] && [ "$kernel_major" -ge 6 ] 2>/dev/null; then
+        kbase="16"
+    fi
     case "$arch" in
         x86_64)
+            # "16" baseline libs only exist for v3/v4/zen4 (no 16v2); fall back to 15v3.
             if grep -q 'avx512f' /proc/cpuinfo 2>/dev/null; then
-                echo "x64-linux-15v4"
+                echo "x64-linux-${kbase}v4"
             elif grep -q 'avx2' /proc/cpuinfo 2>/dev/null; then
-                echo "x64-linux-15v3"
+                echo "x64-linux-${kbase}v3"
             else
                 echo "x64-linux-15v3"
             fi
             ;;
         aarch64)
             local page_size=$(getconf PAGE_SIZE 2>/dev/null || echo 4096)
-            if [ "$page_size" = "16384" ]; then
-                echo "aarch64-linux-15k16"
+            if [ "$kbase" = "16" ]; then
+                # Kernel-6 baseline ships both 16k4 and 16k16
+                if [ "$page_size" = "16384" ]; then
+                    echo "aarch64-linux-16k16"
+                else
+                    echo "aarch64-linux-16k4"
+                fi
             else
-                echo "aarch64-linux-15"
+                # Kernel-5 baseline only ships plain "15" (4K) and "15k16"
+                if [ "$page_size" = "16384" ]; then
+                    echo "aarch64-linux-15k16"
+                else
+                    echo "aarch64-linux-15"
+                fi
             fi
+            ;;
+        riscv64)
+            echo "riscv64-linux-${kbase}"
             ;;
         *)
             echo ""
