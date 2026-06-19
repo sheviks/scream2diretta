@@ -196,6 +196,15 @@ void ScreamDirettaSync::configureFormat(uint32_t sampleRate,
     // and a transfer-mode (configTransferAuto/etc.) have been applied -- the
     // caller orders configureFormat() after those steps.
     size_t cycle = getCycleSize();
+    // Defensive frame alignment: SDK normally returns frame-aligned cycle sizes
+    // (cycle_us * bytesPerSec / 1e6 is naturally aligned for integer cycle_us
+    // and frame-aligned formats), but align here anyway for consistency with
+    // every other threshold above and to harden against any future SDK change.
+    // The producer (diretta_output_send) only ever pushes whole frames, so the
+    // consumer must also pop in whole-frame multiples to avoid L/R drift.
+    if (bytesPerFrame > 0 && cycle > 0) {
+        cycle = (cycle / bytesPerFrame) * bytesPerFrame;
+    }
     if (cycle == 0) {
         // Fallback to ~1ms worth of audio rounded to a frame.
         cycle = bytesPerSecond / 1000;
@@ -213,7 +222,7 @@ void ScreamDirettaSync::configureFormat(uint32_t sampleRate,
 void ScreamDirettaSync::resetGate() {
     m_prefillDone.store(false, std::memory_order_release);
     m_rebuffering.store(false, std::memory_order_release);
-    m_steadyState.store(false, std::memory_order_release);
+    exitSteadyState();   // reconfigure / fresh open: see contract in header
     m_streamCount.store(0, std::memory_order_release);
     m_silentCycles.store(0, std::memory_order_release);
     m_realCycles.store(0, std::memory_order_release);
@@ -336,9 +345,9 @@ bool ScreamDirettaSync::getNewStream(diretta_stream& s) {
         }
         // Steady-state underrun: leave the flag clear so subsequent
         // cycles re-enter the slow path until rebuffering completes.
-        // release here is paired with the slow-path acquire of the
-        // gate flags it is about to consult.
-        m_steadyState.store(false, std::memory_order_release);
+        // release inside the helper is paired with the slow-path
+        // acquire of the gate flags it is about to consult.
+        exitSteadyState();   // Gate 3 underrun arm: see contract in header
         // fall through to Gate 3
     }
 

@@ -255,7 +255,18 @@ private:
     // every reconfigure. Acquire/release pairs with the gate stores
     // so a reader observing m_steadyState==true also observes all
     // prior gate transitions.
+    //
+    // Contract: every site that takes the Sync out of normal play —
+    // (1) Gate 3 underrun arm,
+    // (2) resetGate() on format reconfigure / fresh open,
+    // (3) any future SDK offline/online or ring-resize event —
+    // MUST go through exitSteadyState(). Direct stores to
+    // m_steadyState are forbidden outside this single helper so the
+    // exit set stays in one auditable place.
     std::atomic<bool> m_steadyState{false};
+    void exitSteadyState() {
+        m_steadyState.store(false, std::memory_order_release);
+    }
 
     // Startup mute gate. m_muteBytes is the silent-warmup target in
     // bytes (computed from sample rate and the configured ms). The mute

@@ -104,13 +104,9 @@ struct DirettaState {
     uint32_t bits_per_sample = 0;
 
     // Source format from Scream header (immutable per reconfigure).
-    // When the sink only supports a lower bit depth, conversion_needed
-    // is set and ingress data is down-converted before entering PcmRing.
-    uint32_t source_bits_per_sample = 0;
-    uint32_t source_bytes_per_frame = 0;
-    uint32_t accepted_bits_per_sample = 0;
-    bool conversion_needed = false;
-    std::vector<uint8_t> conversion_buffer; // scratch for ingress down-conversion
+    // The DAC must accept the source bit depth as-is; ingress down-conversion
+    // was removed (was rarely correct, almost never triggered, and the SDK /
+    // user are better placed to choose the right bit depth upstream).
 
     // DSD state (screamalsa sample_size == 1).
     bool is_dsd = false;
@@ -731,35 +727,24 @@ static bool build_format_with_bits(uint8_t rate_byte, uint32_t channels, uint32_
     return out_fc.isValid();
 }
 
-// Negotiate a supported PCM format with the sink, falling back to lower
-// bit depths if the source format is unsupported.
-// Returns the accepted bit depth (8/16/24/32), or 0 if nothing works.
+// Confirm the sink accepts the source format as-is.
+// Returns the accepted bit depth on success, or 0 if the sink rejects it.
+// Ingress down-conversion was removed: when the DAC rejects the source bit
+// depth we fail loudly and tell the user to lower the bit depth at the
+// sender. This keeps the bridge transparent and avoids the bug-prone
+// scalar-truncation path that almost never triggered in practice anyway
+// (Diretta DACs commonly accept 32-bit, which is the Scream default).
 static uint32_t negotiate_sink_format(scream_diretta::ScreamDirettaSync* sync,
                                       const FormatConfigure& source_fc,
                                       uint32_t source_bits) {
     if (sync->checkSinkSupport(source_fc)) {
         return source_bits;
     }
-
-    // Fallback order: try lower bit depths only.
-    const unsigned char try_bits[] = {32, 24, 16};
-    for (unsigned char bits : try_bits) {
-        if (bits >= source_bits) continue;
-        FormatConfigure fallback_fc;
-        if (!build_format_with_bits(g_st.last_rate_byte, g_st.channels, bits, fallback_fc))
-            continue;
-        if (sync->checkSinkSupport(fallback_fc)) {
-            if (!sync->setSinkConfigure(fallback_fc)) {
-                DLOG(0, "setSinkConfigure(%u-bit) failed after checkSinkSupport succeeded", bits);
-                continue;
-            }
-            DLOG(0, "sink does not support %u-bit; auto-downgraded to %u-bit. "
-                 "If you use Scream Windows driver or Album Player, consider setting "
-                 "the sender to %u-bit for best compatibility.",
-                 source_bits, (unsigned)bits, (unsigned)bits);
-            return bits;
-        }
-    }
+    DLOG(0, "sink does not support %u-bit source format. "
+         "Lower the sender bit depth (e.g. set Scream Windows driver or "
+         "Album Player to a bit depth the DAC supports) and try again. "
+         "Ingress down-conversion is intentionally not implemented.",
+         source_bits);
     return 0;
 }
 
@@ -922,7 +907,7 @@ static unsigned int calculateCycleTime(uint32_t sampleRate,
     if (inferredOverhead > 0 && inferredOverhead < 200) {
         overhead = inferredOverhead;
     } else {
-        overhead = (mtu > 2000u) ? 6 : 6;  // default 6 for both paths
+        overhead = (mtu > 2000u) ? 6 : 22;  // jumbo: IP-layer; standard: link-layer
     }
     const uint32_t effMtu = (mtu > static_cast<uint32_t>(overhead))
                                 ? (mtu - overhead)
@@ -1314,37 +1299,6 @@ static inline void queue_push_frames(const uint8_t* data, size_t bytes, uint32_t
     g_st.queue.pushFrames(data, bytes, bpf);
 }
 
-// Scalar sample conversion helpers for ingress down-conversion.
-// These are intentionally simple (no SIMD) — the receiver thread has
-// headroom because Scream packets are already decoded PCM.
-static inline size_t convert_32_to_24_packed(const uint8_t* src, uint8_t* dst, size_t src_bytes) {
-    size_t samples = src_bytes / 4;
-    for (size_t i = 0; i < samples; ++i) {
-        dst[i*3+0] = src[i*4+0];
-        dst[i*3+1] = src[i*4+1];
-        dst[i*3+2] = src[i*4+2];
-    }
-    return samples * 3;
-}
-
-static inline size_t convert_32_to_16(const uint8_t* src, uint8_t* dst, size_t src_bytes) {
-    size_t samples = src_bytes / 4;
-    for (size_t i = 0; i < samples; ++i) {
-        dst[i*2+0] = src[i*4+0];
-        dst[i*2+1] = src[i*4+1];
-    }
-    return samples * 2;
-}
-
-static inline size_t convert_24_to_16(const uint8_t* src, uint8_t* dst, size_t src_bytes) {
-    size_t samples = src_bytes / 3;
-    for (size_t i = 0; i < samples; ++i) {
-        dst[i*2+0] = src[i*3+0];
-        dst[i*2+1] = src[i*3+1];
-    }
-    return samples * 2;
-}
-
 // Bit-reversal lookup table: reverses the order of bits within a byte.
 // Generated by: lut[b] = reverse_bits(b)
 static const uint8_t g_bit_reverse_lut[256] = {
@@ -1420,13 +1374,16 @@ static inline void dsd_transform(const uint8_t* src, uint8_t* dst, size_t bytes,
     }
 }
 
-// Wrapper around queue_push_frames that performs ingress sample conversion
-// when the sink negotiated a lower bit depth than the Scream source, or
-// DSD bit-reversal / byte-swap when the target requires a different format.
+// Wrapper around queue_push_frames that performs DSD bit-reversal /
+// byte-swap / de-interleave when the target requires it.
+// Ingress PCM down-conversion was removed: negotiate_sink_format() now
+// refuses connections where the DAC cannot accept the source bit depth,
+// so src_bpf is always equal to dst_bpf on the PCM path.
 // src_bpf  = bytes per frame of the SOURCE data (Scream header format)
-// dst_bpf  = bytes per frame of the TARGET data (negotiated sink format)
+// dst_bpf  = bytes per frame of the TARGET data (== src_bpf for PCM)
 static inline void queue_push_frames_converted(const uint8_t* data, size_t bytes,
                                                uint32_t src_bpf, uint32_t dst_bpf) {
+    (void)src_bpf;
     if (!g_st.queue_ready || dst_bpf == 0 || bytes == 0) return;
 
     // DSD transformation path: screamalsa outputs byte-interleaved DSD
@@ -1441,41 +1398,7 @@ static inline void queue_push_frames_converted(const uint8_t* data, size_t bytes
         return;
     }
 
-    if (!g_st.conversion_needed || src_bpf == dst_bpf) {
-        queue_push_frames(data, bytes, dst_bpf);
-        return;
-    }
-
-    const size_t src_bps = g_st.source_bits_per_sample / 8;
-    const size_t dst_bps = g_st.bits_per_sample / 8;
-    if (src_bps == 0 || dst_bps == 0) return;
-
-    const size_t src_samples = bytes / src_bps;
-    const size_t dst_bytes = src_samples * dst_bps;
-    if (dst_bytes == 0) return;
-
-    g_st.conversion_buffer.resize(dst_bytes);
-    uint8_t* d = g_st.conversion_buffer.data();
-
-    if (src_bps == 4 && dst_bps == 3) {
-        convert_32_to_24_packed(data, d, bytes);
-    } else if (src_bps == 4 && dst_bps == 2) {
-        convert_32_to_16(data, d, bytes);
-    } else if (src_bps == 3 && dst_bps == 2) {
-        convert_24_to_16(data, d, bytes);
-    } else {
-        // Unsupported conversion path — push raw and log once.
-        static bool warned = false;
-        if (!warned) {
-            warned = true;
-            DLOG(0, "unsupported ingress conversion %zu->%zu bps; pushing raw (may fail)",
-                 src_bps, dst_bps);
-        }
-        queue_push_frames(data, bytes, dst_bpf);
-        return;
-    }
-
-    queue_push_frames(g_st.conversion_buffer.data(), dst_bytes, dst_bpf);
+    queue_push_frames(data, bytes, dst_bpf);
 }
 
 // Runs blocking SDK open calls on a worker thread so the receiver can keep
@@ -1842,7 +1765,7 @@ static uint32_t open_sync_worker_blocking(scream_diretta::ScreamDirettaSync*& ou
         dbg_event("connect_return", "result=fail");
         sync->close();
         delete sync;
-        return false;
+        return 0;
     }
     phase_event("connect_end", "result=ok");
     dbg_event("connect_return", "result=ok");
@@ -1855,7 +1778,7 @@ static uint32_t open_sync_worker_blocking(scream_diretta::ScreamDirettaSync*& ou
         sync->disconnect(false);
         sync->close();
         delete sync;
-        return false;
+        return 0;
     }
     phase_event("connectWait_end",
                 "is_connect=%d is_online=%d is_active=%d",
@@ -1912,70 +1835,20 @@ static void finalize_sync_open_on_receiver(scream_diretta::ScreamDirettaSync* sy
     const diretta_config_t& cfg = g_st.cfg;
     const uint32_t source_bits = g_st.bits_per_sample;
     g_st.sync = sync;
-    g_st.accepted_bits_per_sample = accepted_bits;
 
-    // If the sink negotiated a lower bit depth, reconfigure the queue and
-    // state scalars for the accepted format. The queue is cleared because
-    // any data already pushed was in the source format. Also reconfigure
-    // the Sync's internal format scalars (cycle size, prefill gates) so
-    // getNewStream() uses the negotiated frame size.
-    //
-    // The Sync was already activated by open_sync_worker_blocking() so
-    // the SDK send thread may already be inside getNewStream() touching
-    // the ring. Deactivate it (which waits for any in-flight cycle to
-    // exit) before resizing, then reactivate after configureFormat().
+    // negotiate_sink_format() now refuses any sink that cannot accept the
+    // source bit depth, so accepted_bits must equal source_bits here.
+    // A mismatch would indicate a logic error in the open path.
     if (accepted_bits != source_bits) {
-        sync->deactivate();
-        g_st.bits_per_sample = accepted_bits;
-        g_st.bytes_per_frame = (accepted_bits / 8) * g_st.channels;
-        g_st.queue_bpf = g_st.bytes_per_frame;
-        g_st.conversion_needed = true;
-        configure_unified_queue(g_st.sample_rate, g_st.channels,
-                                accepted_bits / 8, g_st.bytes_per_frame,
-                                g_st.is_dsd ? DSD_SILENCE_BYTE : 0x00);
-        DLOG(1, "format auto-downgrade applied: queue reconfigured for %u-bit "
-             "(was %u-bit). Existing queue data cleared.",
+        DLOG(0, "internal error: accepted_bits=%u != source_bits=%u "
+             "(ingress conversion was removed); refusing open",
              accepted_bits, source_bits);
-        // Update last_fc so reconnect retries use the negotiated format.
-        if (g_st.have_last_fc) {
-            FormatConfigure negotiated_fc;
-            if (build_format_with_bits(g_st.last_rate_byte, g_st.channels, accepted_bits, negotiated_fc)) {
-                g_st.last_fc = negotiated_fc;
-            }
-        }
-        // Re-run configureFormat on the Sync so its cycle size and gates
-        // match the negotiated format.
-        scream_diretta::SyncTuning tuning;
-        int ring_ms  = cfg.ring_buffer_ms > 0 ? cfg.ring_buffer_ms : 1000;
-        int prefill_ms = cfg.prefill_ms     > 0 ? cfg.prefill_ms     : 500;
-        int mute_ms  = cfg.startup_mute_ms  > 0 ? cfg.startup_mute_ms  : 0;
-        int real_delay_ms = cfg.startup_real_delay_ms > 0 ? cfg.startup_real_delay_ms : 0;
-        if (g_st.is_dsd) {
-            ring_ms    = cfg.dsd_buffer_ms  > 0 ? cfg.dsd_buffer_ms  : DSD_BUFFER_MS_DEFAULT;
-            prefill_ms = cfg.dsd_prefill_ms > 0 ? cfg.dsd_prefill_ms : DSD_PREFILL_MS_DEFAULT;
-            const uint32_t mult = g_st.dsd_multiplier > 1 ? g_st.dsd_multiplier : 1;
-            mute_ms       = static_cast<int>(mute_ms * mult);
-            real_delay_ms = static_cast<int>(real_delay_ms * mult);
-            const int dsd_warmup = cfg.dsd_startup_warmup_ms > 0 ? cfg.dsd_startup_warmup_ms : 0;
-            mute_ms += static_cast<int>(dsd_warmup * mult);
-            if (mute_ms > 2000) mute_ms = 2000;
-            if (real_delay_ms > 5000) real_delay_ms = 5000;
-        }
-        tuning.ring_buffer_ms = ring_ms;
-        tuning.prefill_ms     = prefill_ms;
-        tuning.rebuffer_percent = (cfg.rebuffer_percent >= 0.0f && cfg.rebuffer_percent <= 0.95f)
-                                  ? cfg.rebuffer_percent : 0.50f;
-        tuning.underrun_rebuffer_ms = cfg.underrun_rebuffer_ms > 0 ? cfg.underrun_rebuffer_ms : 0;
-        tuning.startup_queue_ms = cfg.startup_queue_ms > 0 ? cfg.startup_queue_ms : 0;
-        tuning.startup_mute_ms  = mute_ms;
-        tuning.startup_real_delay_ms = real_delay_ms;
-        sync->configureFormat(g_st.sample_rate, g_st.channels, accepted_bits / 8, tuning);
-        // Reactivate now that the ring has been resized and the Sync's
-        // per-format scalars are back in sync. From here the SDK send
-        // thread may resume real getNewStream() cycles.
-        sync->activate();
-    } else {
-        g_st.conversion_needed = false;
+        sync->deactivate();
+        sync->disconnect(false);
+        sync->close();
+        delete sync;
+        g_st.sync = nullptr;
+        return;
     }
 
     if (!g_st.phase_logged_open_grace_begin) {
@@ -2333,10 +2206,6 @@ static bool reconfigure(const receiver_format_t& rf) {
     g_st.channels = ch;
     g_st.bits_per_sample = bits;
     g_st.bytes_per_frame = bpf;
-    g_st.source_bits_per_sample = bits;
-    g_st.source_bytes_per_frame = bpf;
-    g_st.accepted_bits_per_sample = bits;
-    g_st.conversion_needed = false;
     g_st.last_fc = fc;
     g_st.have_last_fc = true;
     g_st.format_changes.fetch_add(1, std::memory_order_relaxed);
@@ -3959,11 +3828,11 @@ ingress_only:
     // destination.
     if (g_st.queue_ready) {
         const uint32_t dst_bpf = g_st.queue_bpf;
-        const uint32_t src_bpf = g_st.source_bytes_per_frame;
-        // dst_bpf is the negotiated (target) frame size; src_bpf is the
-        // Scream source frame size.  When no conversion is active they
-        // are equal.  Partial-frame carry is always done in the SOURCE
-        // domain; whole frames are converted before entering the queue.
+        const uint32_t src_bpf = g_st.bytes_per_frame;
+        // src_bpf == dst_bpf for the PCM path (ingress down-conversion was
+        // removed; negotiate_sink_format() refuses unsupported bit depths).
+        // The DSD path still re-arranges bytes inside queue_push_frames_converted
+        // but keeps the same frame size.
         if (dst_bpf == 0 || dst_bpf > PARTIAL_FRAME_MAX || g_st.bytes_per_frame != dst_bpf) {
             // Format scalars and queue bpf must agree — defensive.
         } else {
