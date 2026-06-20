@@ -50,6 +50,7 @@ typedef enum diretta_transfer_mode_e {
     DIRETTA_TM_VARAUTO,     /* configTransferVarAuto */
     DIRETTA_TM_FIXAUTO,     /* configTransferFixAuto */
     DIRETTA_TM_RANDOM,      /* configTransferRandom */
+    DIRETTA_TM_AUTOFIX,     /* configTransferFixAuto when cycletime set, else auto B-branch */
 } diretta_transfer_mode_t;
 
 /* Logging verbosity mapped onto SDK SysLog level. */
@@ -279,19 +280,6 @@ typedef struct diretta_stats_s {
     uint64_t dsd_active;        /* 1 if current format is DSD */
     uint64_t dsd_multiplier;    /* 1=DSD64, 2=DSD128, 4=DSD256, 8=DSD512 */
     uint64_t dsd_real_rate;     /* e.g. 2822400 for DSD64 */
-
-    /* Live values from the most recent SDK<->Target info-cycle exchange
-     * (statusUpdate callback inside the SDK, at --info-cycle rate).
-     * Populated from ScreamDirettaSync::lastInfo*(). In TargetProfile
-     * mode these can change after the initial open as the SDK adapts
-     * using feedback from the Target. In SelfProfile (limit=0) they are
-     * stable. These are always captured (lightweight monitoring on the
-     * SDK control thread; no effect on receiver or data send hot paths).
-     */
-    uint64_t current_sdk_cycle_us;  /* getCycleTime() after last info exchange */
-    uint64_t current_profile_mode;  /* Profile::ModeType after last exchange */
-    uint64_t current_latency_us;    /* getLatency() after last info exchange */
-    uint64_t info_update_count;     /* number of statusUpdate calls so far */
 } diretta_stats_t;
 
 /* Initialise sane defaults. */

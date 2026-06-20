@@ -233,7 +233,7 @@ sudo ./scream2diretta -t 1 -p 4011 \
 | `-i <iface>` | — | Bind to specific network interface |
 | `-g <group>` | 239.255.77.77 | Multicast group address (multicast mode only) |
 | `--thread-mode <mask>` | 1 (CRITICAL) | SDK thread mode bitmask |
-| `--transfer-mode <mode>` | auto | auto / varmax / varauto / fixauto / random |
+| `--transfer-mode <mode>` | auto | auto / varmax / varauto / fixauto / autofix / random (see [Transfer Modes](#transfer-modes)) |
 | `--mtu <bytes>` | auto | Network MTU (default auto-detect, usually 9000 for jumbo frames) |
 | `--pcm-buffer-ms <ms>` | 1000 | PcmRing total size |
 | `--pcm-prefill-ms <ms>` | 500 | Fill threshold before first pull |
@@ -248,6 +248,66 @@ sudo ./scream2diretta -t 1 -p 4011 \
 | `--no-mlock` | off | Disable `mlockall` (default pins all pages in RAM) |
 | `--stats --stats-interval <sec>` | off | Periodic stats |
 | `-v` / `-vv` | off | Verbose / very verbose |
+
+### Transfer Modes
+
+`--transfer-mode` selects how s2d configures the Diretta SDK send profile.
+Across every mode the **single packet per cycle** invariant is preserved:
+the 1-packet physical bound is `varmax_cycle` (the cycle that exactly fills
+one `effMtu` packet at the current format), and an explicit `--cycle-time`
+is additionally checked against `safe_max = varmax_cycle x 0.97` (a 3%
+margin that absorbs overhead-inference jitter) so `cycle_packets` never
+silently rises to 2.
+
+| Mode | Without `--cycle-time` | With `--cycle-time` |
+|------|------------------------|---------------------|
+| `auto` | low-bitrate (<=16-bit & <=48k) or DSD -> VarAuto; else VarMax | `cycle <= safe_max` -> **VarAuto**(cycle) (`auto-varauto-cycle`); else VarMax-override + `[warn]` (`auto-varmax-override`) |
+| `autofix` | same as `auto` (low-bitrate/DSD -> VarAuto, else VarMax) | `cycle <= safe_max` -> **FixAuto**(cycle) (`autofix-fixauto`); else VarMax-override + `[warn]` (`autofix-varmax-override`) |
+| `varmax` | VarMax(cycle) | VarMax(cycle) |
+| `varauto` | VarAuto(cycle) | VarAuto(cycle) |
+| `fixauto` | FixAuto(cycle) | FixAuto(cycle) |
+| `random` | Random(cycle, cycle-min) | Random(cycle, cycle-min) |
+
+**`auto` vs `autofix` with `--cycle-time`** is the only difference between
+the two: both carry the same target cycle under the 1-packet bound, but
+they anchor it differently.
+
+- **`autofix` uses FixAuto** (cycle-anchored): the cycle is honoured
+  verbatim. Measured `sdk_cycle` equals `target_cycle` exactly
+  (e.g. 800us -> 800us).
+- **`auto` uses VarAuto** (size-anchored): the SDK anchors the payload
+  size and the cycle becomes a frame-quantized by-product. In practice,
+  when a single packet fits, the offset is negligible
+  (e.g. 800us -> 803us, ~0.4%, zero underruns).
+
+Both land on `cycle_packets=1`. Use `autofix` when you want the SDK's
+reported cycle to match your requested value exactly; use `auto` (the
+default) otherwise.
+
+Under an active Target Profile (`--target-profile-limit > 0`), `autofix`
+is equivalent to `fixauto` (`pm.configTransferFixAuto(cycle)`).
+
+#### Reading the `transfer:` log line (`-vv`)
+
+```
+transfer: mtu=1518 mode=auto-varauto-cycle mode_sdk=variable target_cycle=800us sdk_cycle=803us cycle_size=616B cycle_packets=1
+```
+
+- `mode` — the s2d decision string (which branch was taken, e.g.
+  `auto-varauto-cycle`, `autofix-fixauto`, `auto-varmax-override`).
+- `mode_sdk` — read-back of `Sync::getMode()`: the send-profile mode the
+  SDK actually quantized our config into (`variable` / `fix` / `random` /
+  `triangolo`). Useful to confirm e.g. `autofix-fixauto` -> `mode_sdk=fix`.
+- `target_cycle` — the cycle s2d handed to the SDK (the *instruction*).
+- `sdk_cycle` / `cycle_size` / `cycle_packets` — read-back of the SDK's
+  negotiated send-profile *snapshot* (set at open / re-negotiation).
+- `min_cycle` — read-back of `Sync::getMinCycleTime()`, **printed only when
+  > 0**. Under SelfProfile (`--target-profile-limit 0`) this stays 0 and
+  the field is suppressed to avoid noise.
+
+Note that all read-back getters expose the **host-side negotiated send
+profile**, not live target telemetry; they only change on a format
+re-negotiation.
 
 ### Tuning for Sound Quality
 

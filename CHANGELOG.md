@@ -8,6 +8,74 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **New `--transfer-mode=autofix`**. A cycle-anchored variant of `auto`
+  that preserves the original 0.4.0 `auto + --cycle-time` behaviour:
+  `cycle <= safe_max` -> `configTransferFixAuto(cycle)` (`autofix-fixauto`,
+  cycle honoured verbatim); over the 1-packet bound -> VarMax-override +
+  `[warn]` (`autofix-varmax-override`). Without `--cycle-time` it matches
+  the `auto` low-bitrate/DSD -> VarAuto, else VarMax decision
+  (`autofix-varauto` / `autofix-varmax`). Under an active Target Profile
+  it is equivalent to `fixauto`. Use `autofix` when you need `sdk_cycle`
+  to equal `target_cycle` exactly; verified on Pi5 at 96k/32-bit with
+  `CYCLETIME=800`: `mode=autofix-fixauto mode_sdk=fix target_cycle=800us
+  sdk_cycle=800us cycle_packets=1`, zero underruns.
+  (`diretta.h`, `diretta.cpp`, `scream.c`)
+
+- **`transfer:` log now reports `mode_sdk` and a conditional `min_cycle`**.
+  `mode_sdk` is the read-back of `Sync::getMode()` (the send-profile mode
+  the SDK quantized our config into: `variable` / `fix` / `random` /
+  `triangolo`), letting you confirm the decision string against what the
+  SDK actually applied (e.g. `autofix-fixauto` -> `mode_sdk=fix`,
+  `auto-varauto-cycle` -> `mode_sdk=variable`). `min_cycle`
+  (`Sync::getMinCycleTime()`) is appended **only when > 0**; under
+  SelfProfile (`--target-profile-limit 0`) it stays 0 and is suppressed.
+  All five const send-profile getters are now surfaced; the read-backs
+  expose the host-side negotiated profile snapshot, not live target
+  telemetry. (`diretta.cpp`)
+
+### Changed
+
+- **`--transfer-mode=auto` + `--cycle-time` now carries the cycle via
+  VarAuto instead of FixAuto** (revises 0.4.0). The satisfied branch
+  changed from `configTransferFixAuto(cycle)` (`auto-fixauto`) to
+  `configTransferVarAuto(cycle)` (`auto-varauto-cycle`). VarAuto anchors
+  the payload size and lets the cycle quantize to a frame boundary; in
+  single-packet operation the offset is negligible (Pi5, 96k/32-bit,
+  `CYCLETIME=800`: `target_cycle=800us -> sdk_cycle=803us`, ~0.4%, zero
+  underruns). The 97% single-packet bound, the over-limit
+  `auto-varmax-override` branch, and the no-cycle-time B-branch
+  (low-bitrate/DSD -> VarAuto, else VarMax) are unchanged. The previous
+  cycle-anchored behaviour remains available via the new `autofix` mode.
+  (`diretta.cpp`)
+
+### Fixed
+
+- **Transient cleanup/worker thread no longer inherits SCHED_FIFO 80**.
+  On format re-negotiation a short-lived helper thread was spawned by the
+  async worker / cleanup path and inherited the receiver's `FIFO 80`
+  scheduling (the `FF80` seen in `chrt`), briefly contending with the
+  isolated audio cores. The thread entry now explicitly resets to
+  `SCHED_OTHER` (`pthread_setschedparam` with prio 0) and then applies
+  `nice(-10)`, so it runs as a normal (slightly favoured) thread instead
+  of a real-time one. Steady state remains the intended 2 RT threads
+  (receiver + SDK send, both `FIFO 80`). (`diretta.cpp`)
+
+### Removed
+
+- **Dead `statusUpdate()` telemetry cluster**. SDK 149 never invokes the
+  `statusUpdate()` push callback (confirmed by tcpdump + code: the hook is
+  dead), so the supporting machinery was removed: the `m_lastInfo*` fields,
+  the `lastInfo*` accessors, the `current_*` / `info_update_count` stats
+  members, the telemetry "active" logging, and the live-cycle suffix. An
+  empty `void statusUpdate() override {}` is kept for DRUP parity with a
+  corrected comment noting SDK 149 exposes no real-time target read. A
+  prototyped `--target-info` PULL probe (added and removed in development)
+  was also dropped after it was confirmed to read the host-side negotiated
+  send-profile snapshot rather than live target state.
+  (`diretta_sync.h`, `diretta_sync.cpp`, `diretta.cpp`)
+
 ---
 
 ## [0.4.0] - 2026-06-17

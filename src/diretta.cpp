@@ -974,6 +974,12 @@ static const char* apply_transfer_mode(Sync& sb,
                 pm.configTransferFixAuto(cycle);
                 name = "profile-fixauto";
                 break;
+            case DIRETTA_TM_AUTOFIX:
+                // Under an active Target Profile, autofix == cycle-anchored
+                // FixAuto (same as the explicit FIXAUTO path).
+                pm.configTransferFixAuto(cycle);
+                name = "profile-autofix";
+                break;
             case DIRETTA_TM_RANDOM:
                 pm.configTransferRandom(cycle, cycleMin, /*fragments*/ 1);
                 name = "profile-random";
@@ -1005,19 +1011,65 @@ static const char* apply_transfer_mode(Sync& sb,
         case DIRETTA_TM_RANDOM:
             sb.configTransferRandom(cycle, cycleMin, /*fragments*/ 1);
             return "random";
+        case DIRETTA_TM_AUTOFIX: {
+            // AUTOFIX: cycle-anchored variant of AUTO. This is the legacy
+            // auto+cycletime behaviour, kept as an explicit mode so callers
+            // who want FixAuto (cycle honored verbatim) instead of the new
+            // VarAuto-based auto+cycletime carrier can opt in.
+            //
+            // A. cfg.cycle_us > 0:
+            //      user_cycle <= safe_max  -> FixAuto(user_cycle)  (cycle-anchored)
+            //      user_cycle >  safe_max  -> override to VarMax(varmax_cycle)
+            // B. cfg.cycle_us == 0:
+            //      same as AUTO B-branch (low-bitrate/DSD -> VarAuto,
+            //      normal/high-rate PCM -> VarMax).
+            if (cfg.cycle_us > 0) {
+                const unsigned int safe_max = static_cast<unsigned int>(
+                    static_cast<double>(varmax_cycle) * 0.97);
+                if (cycle_us <= safe_max) {
+                    sb.configTransferFixAuto(cycle);
+                    // out_effective_cycle_us already = cycle_us (= user value)
+                    return "autofix-fixauto";
+                } else {
+                    DLOG(0, "[warn] requested cycle_time_us=%u exceeds 1-packet "
+                            "limit (varmax_cycle=%u, safe_max=%u) at "
+                            "%uHz/%ubit/%uch; falling back to varmax",
+                         cycle_us, varmax_cycle, safe_max,
+                         g_st.sample_rate, g_st.bits_per_sample, g_st.channels);
+                    sb.configTransferVarMax(Clock::MicroSeconds(varmax_cycle));
+                    out_effective_cycle_us = varmax_cycle;
+                    return "autofix-varmax-override";
+                }
+            }
+            // cfg.cycle_us == 0: identical to AUTO B-branch.
+            const bool isLowBitrate = (g_st.bits_per_sample <= 16
+                                       && g_st.sample_rate <= 48000);
+            if (isLowBitrate || g_st.is_dsd) {
+                sb.configTransferVarAuto(cycle);
+                return g_st.is_dsd ? "autofix-varauto-dsd" : "autofix-varauto";
+            } else {
+                sb.configTransferVarMax(cycle);
+                return "autofix-varmax";
+            }
+        }
         case DIRETTA_TM_AUTO:
         default: {
             // AUTO logic (two sub-cases):
             //
             // A. User explicitly gave --cycle-time (cfg.cycle_us > 0):
-            //    Treat user cycle as primary intent. Apply via FixAuto so the
-            //    cycle is honored verbatim, BUT only if 1 packet still fits
-            //    within effMtu at that cycle. The 1-packet bound is
+            //    Treat user cycle as primary intent. Apply via VarAuto so the
+            //    cycle is carried as the anchor, BUT only if 1 packet still
+            //    fits within effMtu at that cycle. The 1-packet bound is
             //    varmax_cycle (cycle that exactly fills effMtu). We use a 3%
             //    safety margin to absorb overhead-inference jitter so we
             //    don't silently fall to 2 packets/cycle.
-            //      user_cycle <= safe_max  -> FixAuto(user_cycle)
+            //      user_cycle <= safe_max  -> VarAuto(user_cycle)
             //      user_cycle >  safe_max  -> override to VarMax(varmax_cycle)
+            //    NOTE: VarAuto (size-anchored) may yield a slightly larger
+            //    cycle offset than FixAuto (cycle-anchored), but in single-
+            //    packet operation the measured offset is negligible (<1%).
+            //    The cycle-anchored FixAuto variant is available via the
+            //    explicit `autofix` mode below.
             //
             // B. No --cycle-time (cfg.cycle_us == 0):
             //    DRUP-style policy: low-bitrate (<=16bit/<=48k) or DSD →
@@ -1027,9 +1079,9 @@ static const char* apply_transfer_mode(Sync& sb,
                 const unsigned int safe_max = static_cast<unsigned int>(
                     static_cast<double>(varmax_cycle) * 0.97);
                 if (cycle_us <= safe_max) {
-                    sb.configTransferFixAuto(cycle);
+                    sb.configTransferVarAuto(cycle);
                     // out_effective_cycle_us already = cycle_us (= user value)
-                    return "auto-fixauto";
+                    return "auto-varauto-cycle";
                 } else {
                     DLOG(0, "[warn] requested cycle_time_us=%u exceeds 1-packet "
                             "limit (varmax_cycle=%u, safe_max=%u) at "
@@ -1670,15 +1722,36 @@ static uint32_t open_sync_worker_blocking(scream_diretta::ScreamDirettaSync*& ou
         const long long sdk_cycle = (long long)(sync->getCycleTime().getMicroSeconds());
 
         if (verbosity >= 2) {
-            DLOG(2, "transfer: mtu=%u mode=%s target_cycle=%dus sdk_cycle=%lldus "
-                 "cycle_size=%zuB cycle_packets=%zu",
-                 (unsigned)eff_mtu, applied_mode, target_cycle, sdk_cycle,
-                 (size_t)sync->getCycleSize(),
-                 (size_t)sync->getCyclePackets());
-            if (cfg.target_profile_limit_us > 0) {
-                DLOG(2, "info-cycle telemetry active (TargetProfile): period=%d us (live values from statusUpdate will be reported in stats when cycle adapts)",
-                     cfg.info_cycle_us > 0 ? cfg.info_cycle_us : 100000);
+            // mode_sdk: the send-profile ModeType the SDK quantized our config
+            // into (read-back of getMode()). Maps Profile::ModeType:
+            //   VARIABLE=0, FIX=1, RANDOM=2, TRIANGOLO=3.
+            const int mode_raw = static_cast<int>(sync->getMode());
+            const char* mode_sdk;
+            switch (mode_raw) {
+                case 0:  mode_sdk = "variable";  break;
+                case 1:  mode_sdk = "fix";       break;
+                case 2:  mode_sdk = "random";    break;
+                case 3:  mode_sdk = "triangolo"; break;
+                default: mode_sdk = "unknown";   break;
             }
+            // min_cycle: SDK's minimum generated transmission interval
+            // (getMinCycleTime). Only meaningful when >0; under SelfProfile
+            // it stays 0, so suppress the field in that case to avoid noise.
+            const long long min_cycle =
+                (long long)(sync->getMinCycleTime().getMicroSeconds());
+            char min_cycle_buf[32];
+            if (min_cycle > 0) {
+                snprintf(min_cycle_buf, sizeof(min_cycle_buf),
+                         " min_cycle=%lldus", min_cycle);
+            } else {
+                min_cycle_buf[0] = '\0';
+            }
+            DLOG(2, "transfer: mtu=%u mode=%s mode_sdk=%s target_cycle=%dus "
+                 "sdk_cycle=%lldus cycle_size=%zuB cycle_packets=%zu%s",
+                 (unsigned)eff_mtu, applied_mode, mode_sdk, target_cycle, sdk_cycle,
+                 (size_t)sync->getCycleSize(),
+                 (size_t)sync->getCyclePackets(),
+                 min_cycle_buf);
         }
 
         g_st.target_cycle_us = static_cast<uint64_t>(target_cycle);
@@ -1984,6 +2057,17 @@ static bool start_async_sync_open(const FormatConfigure& fc, const char* reason)
     g_st.async_open_accepted_bits.store(0, std::memory_order_relaxed);
     g_st.async_open_thread = std::thread([fc]() {
 #if defined(__linux__)
+        // This worker is spawned from a context that may itself be running
+        // SCHED_FIFO (e.g. the receiver thread at --rt-priority): a pthread
+        // created there INHERITS the parent's SCHED_FIFO policy + priority.
+        // open_sync_worker_blocking() does blocking network handshakes, so it
+        // must NOT run at real-time priority competing with the audio threads.
+        // Demote to SCHED_OTHER first so the subsequent nice(-10) actually
+        // takes effect (nice is a no-op under SCHED_FIFO).
+        {
+            struct sched_param sp; sp.sched_priority = 0;
+            pthread_setschedparam(pthread_self(), SCHED_OTHER, &sp);
+        }
         ::nice(-10);
 #endif
         scream_diretta::ScreamDirettaSync* sync_local = nullptr;
@@ -2082,6 +2166,15 @@ static void cleanup_sync_async(scream_diretta::ScreamDirettaSync* old,
     // then safe to call directly because no SDK thread is mid-pull.
     std::thread t([old, reason]() {
 #if defined(__linux__)
+        // Same rationale as the async-open worker: a thread spawned from a
+        // SCHED_FIFO context inherits real-time policy. bounded_disconnect() +
+        // close() + delete are blocking cleanup work that must not preempt the
+        // audio threads, so demote to SCHED_OTHER before nice(-10) (which is
+        // otherwise ignored under SCHED_FIFO).
+        {
+            struct sched_param sp; sp.sched_priority = 0;
+            pthread_setschedparam(pthread_self(), SCHED_OTHER, &sp);
+        }
         ::nice(-10);
 #endif
         const auto t0 = std::chrono::steady_clock::now();
@@ -2516,19 +2609,12 @@ static void format_stats_line(const char* tag, char* out, size_t outlen) {
         const long long prev_fill_b = (long long)g_st.last_stats_ring_fill_bytes;
         fill_delta_ms = (long long)(((cur_fill_b - prev_fill_b) * 1000) / (long long)bps);
     }
-    char live_suffix[64] = "";
-    if (s.info_update_count > 0 && s.current_sdk_cycle_us != s.sdk_cycle_us) {
-        std::snprintf(live_suffix, sizeof(live_suffix),
-                      " | live-cycle=%lluus (updates=%llu)",
-                      (unsigned long long)s.current_sdk_cycle_us,
-                      (unsigned long long)s.info_update_count);
-    }
     std::snprintf(out, outlen,
         "[diretta] %s: pushed=%llu B / %llu fr | dropped=%llu B / %llu fr / %llu ms"
         " | partial_carry=%llu | fmt_changes=%llu | underruns=%llu (events=%llu)"
         " | fill=%llu/%llu B (~%llu ms) | cycles real=%llu silent=%llu"
         " | push_delta_ms=%lld drain_delta_ms=%lld net_fill_delta_ms=%lld "
-        "fill_delta_ms=%lld%s%s",
+        "fill_delta_ms=%lld%s",
         tag,
         (unsigned long long)s.pushed_bytes,
         (unsigned long long)s.pushed_frames,
@@ -2545,8 +2631,7 @@ static void format_stats_line(const char* tag, char* out, size_t outlen) {
         (unsigned long long)s.real_cycles,
         (unsigned long long)s.silent_cycles,
         push_delta_ms, drain_delta_ms, net_fill_delta_ms, fill_delta_ms,
-        s.dsd_active ? " | dsd" : "",
-        live_suffix);
+        s.dsd_active ? " | dsd" : "");
 
     g_st.last_stats_pushed_bytes     = s.pushed_bytes;
     g_st.last_stats_popped_bytes     = s.popped_bytes;
@@ -2946,6 +3031,7 @@ extern "C" int diretta_output_init(const diretta_config_t *cfg) {
             case DIRETTA_TM_VARAUTO: tmode_name = "varauto"; break;
             case DIRETTA_TM_FIXAUTO: tmode_name = "fixauto"; break;
             case DIRETTA_TM_RANDOM:  tmode_name = "random"; break;
+            case DIRETTA_TM_AUTOFIX: tmode_name = "autofix"; break;
         }
         std::fprintf(stderr,
             "[diretta] SDK config: target_buffer_ms=%d (setSink buffer) "
@@ -3929,14 +4015,6 @@ extern "C" int diretta_get_stats(diretta_stats_t *out) {
         out->real_cycles   = g_st.sync->realCycles();
         out->underrun_events = g_st.sync->underrunEvents();
         out->popped_bytes    = g_st.sync->poppedBytes();
-        // Live info-exchange snapshot (refreshed by SDK at --info-cycle
-        // via statusUpdate()). Safe to read from any thread; these are
-        // the values the SDK learned from the Target during the most
-        // recent info/control/status packet exchange.
-        out->current_sdk_cycle_us = g_st.sync->lastInfoCycleUs();
-        out->current_profile_mode = static_cast<uint64_t>(g_st.sync->lastInfoMode());
-        out->current_latency_us   = g_st.sync->lastInfoLatencyUs();
-        out->info_update_count    = g_st.sync->infoUpdateCount();
     }
     out->target_cycle_us = g_st.target_cycle_us;
     out->sdk_cycle_us    = g_st.sdk_cycle_us;

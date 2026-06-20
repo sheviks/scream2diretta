@@ -150,7 +150,7 @@ static void show_usage(const char *arg0)
   fprintf(stderr, "                               Default: auto-calculated from format and MTU.\n");
   fprintf(stderr, "  --cycle-min-time <us>        Min cycle time in microseconds (random mode only).\n");
   fprintf(stderr, "  --info-cycle <us>            Info packet cycle in microseconds (default: 100000).\n");
-  fprintf(stderr, "  --transfer-mode <mode>       Transfer mode: auto, varmax, varauto, fixauto, random.\n");
+  fprintf(stderr, "  --transfer-mode <mode>       Transfer mode: auto, varmax, varauto, fixauto, autofix, random.\n");
   fprintf(stderr, "  --target-profile-limit <us>  Target profile limit cycle (0=SelfProfile, default: 0,\n");
   fprintf(stderr, "                               >0=TargetProfile via ProfileMaker(limit=us)).\n");
   fprintf(stderr, "  --mtu <bytes>                MTU override (default: auto-detect).\n");
@@ -234,6 +234,7 @@ static int parse_transfer_mode(const char *s, diretta_transfer_mode_t *out) {
   if (strcmp(s, "varauto") == 0) { *out = DIRETTA_TM_VARAUTO; return 0; }
   if (strcmp(s, "fixauto") == 0) { *out = DIRETTA_TM_FIXAUTO; return 0; }
   if (strcmp(s, "random") == 0)  { *out = DIRETTA_TM_RANDOM; return 0; }
+  if (strcmp(s, "autofix") == 0) { *out = DIRETTA_TM_AUTOFIX; return 0; }
   return 1;
 }
 #endif
@@ -552,7 +553,7 @@ int main(int argc, char*argv[]) {
       break;
     case OPT_TRANSFER_MODE:
       if (parse_transfer_mode(optarg, &dcfg.transfer_mode) != 0) {
-        fprintf(stderr, "--transfer-mode must be one of: auto, varmax, varauto, fixauto, random\n");
+        fprintf(stderr, "--transfer-mode must be one of: auto, varmax, varauto, fixauto, autofix, random\n");
         return 1;
       }
       break;

@@ -233,7 +233,7 @@ sudo ./scream2diretta -t 1 -p 4011 \
 | `-i <iface>` | — | 绑定到指定网络接口 |
 | `-g <group>` | 239.255.77.77 | 组播组地址（仅组播模式） |
 | `--thread-mode <mask>` | 1 (CRITICAL) | SDK 线程模式位掩码 |
-| `--transfer-mode <mode>` | auto | auto / varmax / varauto / fixauto / random |
+| `--transfer-mode <mode>` | auto | auto / varmax / varauto / fixauto / autofix / random（见[传输模式](#传输模式)） |
 | `--mtu <bytes>` | auto | 网络 MTU（默认自动检测，巨型帧通常为 9000） |
 | `--pcm-buffer-ms <ms>` | 1000 | PcmRing 总大小 |
 | `--pcm-prefill-ms <ms>` | 500 | 首次拉取前的填充阈值 |
@@ -244,6 +244,60 @@ sudo ./scream2diretta -t 1 -p 4011 \
 | `--cpu-other <core>` | — | 将辅助线程绑定到指定核心 |
 | `--stats --stats-interval <sec>` | off | 周期性统计 |
 | `-v` / `-vv` | off | 详细 / 非常详细 |
+
+### 传输模式
+
+`--transfer-mode` 决定 s2d 如何配置 Diretta SDK 的发送 profile。
+所有模式都保持**每个 cycle 只发一个 packet**的不变量：1-packet
+物理上界是 `varmax_cycle`（在当前格式下恰好填满一个 `effMtu`
+的周期）；显式 `--cycle-time` 还会额外与 `safe_max =
+varmax_cycle x 0.97`（3% 裕度，用于吸收 overhead 推断抖动）比较，
+以防 `cycle_packets` 静默涨到 2。
+
+| 模式 | 无 `--cycle-time` | 有 `--cycle-time` |
+|------|-------------------|--------------------|
+| `auto` | 低码率（≤16bit 且 ≤48k）或 DSD → VarAuto；否则 VarMax | `cycle ≤ safe_max` → **VarAuto**(cycle)（`auto-varauto-cycle`）；否则 VarMax-override + `[warn]`（`auto-varmax-override`） |
+| `autofix` | 同 `auto`（低码率/DSD → VarAuto，否则 VarMax） | `cycle ≤ safe_max` → **FixAuto**(cycle)（`autofix-fixauto`）；否则 VarMax-override + `[warn]`（`autofix-varmax-override`） |
+| `varmax` | VarMax(cycle) | VarMax(cycle) |
+| `varauto` | VarAuto(cycle) | VarAuto(cycle) |
+| `fixauto` | FixAuto(cycle) | FixAuto(cycle) |
+| `random` | Random(cycle, cycle-min) | Random(cycle, cycle-min) |
+
+**`auto` 与 `autofix` 在带 `--cycle-time` 时的唯一区别**：两者都在
+1-packet 上界内承载同一个目标周期，但锚定方式不同：
+
+- **`autofix` 用 FixAuto**（周期-锚定）：周期被逐字 honor。实测
+  `sdk_cycle` 与 `target_cycle` 精确相等（例如 800us → 800us）。
+- **`auto` 用 VarAuto**（size-锚定）：SDK 锚定负载 size，周期退化
+  为按帧量化的副产物。实测中，当单 packet 能装下时偏差可
+  忽略（例如 800us → 803us，约 0.4%，零 underrun）。
+
+两者都落在 `cycle_packets=1`。如果你希望 SDK 报告的周期与你请求值
+精确一致，用 `autofix`；其余情况用 `auto`（默认）。
+
+在 Target Profile 激活时（`--target-profile-limit > 0`），`autofix`
+等同 `fixauto`（`pm.configTransferFixAuto(cycle)`）。
+
+#### 读懂 `transfer:` 日志行（`-vv`）
+
+```
+transfer: mtu=1518 mode=auto-varauto-cycle mode_sdk=variable target_cycle=800us sdk_cycle=803us cycle_size=616B cycle_packets=1
+```
+
+- `mode` — s2d 的决策字符串（走了哪个分支，如 `auto-varauto-cycle`、
+  `autofix-fixauto`、`auto-varmax-override`）。
+- `mode_sdk` — `Sync::getMode()` 的读回：SDK 把我方 config 量化后实际
+  采用的发送 profile 模式（`variable` / `fix` / `random` / `triangolo`）。
+  可用于核对，例如 `autofix-fixauto` → `mode_sdk=fix`。
+- `target_cycle` — s2d 下给 SDK 的周期（**指令**）。
+- `sdk_cycle` / `cycle_size` / `cycle_packets` — SDK 协商好的发送
+  profile **快照**读回（在 open / 重协商时确定）。
+- `min_cycle` — `Sync::getMinCycleTime()` 的读回，**仅当 > 0 时才打印**。
+  SelfProfile（`--target-profile-limit 0`）下该值为 0，字段被抑制以
+  避免噪声。
+
+注意：所有读回 getter 暴露的是**本机侧协商好的发送 profile**，而非
+ target 实时遥测；它们只在格式重协商时变化。
 
 ### 音质调优
 
