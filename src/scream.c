@@ -137,6 +137,10 @@ static void show_usage(const char *arg0)
   fprintf(stderr, "                               the SDK then pulls real PCM from cycle one.\n");
   fprintf(stderr, "  --rebuffer-percent <pct>    Resume real PCM after underrun when PcmRing reaches <pct>%%\n");
   fprintf(stderr, "                               full (default 50, range 0..95; 0 disables hold).\n");
+  fprintf(stderr, "  --upstream-idle-timeout-sec <s> Release the Diretta Target after the upstream stops\n");
+  fprintf(stderr, "                               sending PCM for <s> seconds, so it stops receiving a\n");
+  fprintf(stderr, "                               long-term silence stream (default 120; 0 disables,\n");
+  fprintf(stderr, "                               range 10..3600). Reopens automatically when audio resumes.\n");
   fprintf(stderr, "\n");
   fprintf(stderr, "DSD buffering (used when Scream sender signals DSD via sample_size==1):\n");
   fprintf(stderr, "  --dsd-buffer-ms <ms>         DSD ring length in ms (default 1500, range 50..5000).\n");
@@ -259,6 +263,7 @@ enum {
   OPT_STATS,
   OPT_DIRETTA_DEBUG,
   OPT_FORMAT_CHANGE_COOLDOWN_MS,
+  OPT_UPSTREAM_IDLE_TIMEOUT_SEC,
   OPT_UNDERRUN_REBUFFER_PERCENT,
   OPT_UNDERRUN_REBUFFER_MS,
   OPT_STARTUP_REAL_DELAY_MS,
@@ -317,6 +322,7 @@ static const struct option long_options[] = {
   { "stats",                no_argument,       0, OPT_STATS },
   { "diretta-debug",        no_argument,       0, OPT_DIRETTA_DEBUG },
   { "format-change-cooldown-ms", required_argument, 0, OPT_FORMAT_CHANGE_COOLDOWN_MS },
+  { "upstream-idle-timeout-sec", required_argument, 0, OPT_UPSTREAM_IDLE_TIMEOUT_SEC },
   { "underrun-rebuffer-percent", required_argument, 0, OPT_UNDERRUN_REBUFFER_PERCENT },
   { "underrun-rebuffer-ms",      required_argument, 0, OPT_UNDERRUN_REBUFFER_MS },
   { "startup-real-delay-ms",     required_argument, 0, OPT_STARTUP_REAL_DELAY_MS },
@@ -749,6 +755,15 @@ int main(int argc, char*argv[]) {
       dcfg.format_change_cooldown_ms = v;
       break;
     }
+    case OPT_UPSTREAM_IDLE_TIMEOUT_SEC: {
+      int v = atoi(optarg);
+      if (v != 0 && (v < 10 || v > 3600)) {
+        fprintf(stderr, "--upstream-idle-timeout-sec must be 0 (disabled) or 10..3600\n");
+        return 1;
+      }
+      dcfg.upstream_idle_timeout_sec = v;
+      break;
+    }
     case OPT_UNDERRUN_REBUFFER_PERCENT: {
       double pct = atof(optarg);
       if (pct < 0.0 || pct > 95.0) {
@@ -887,6 +902,7 @@ int main(int argc, char*argv[]) {
     case OPT_STATS:
     case OPT_DIRETTA_DEBUG:
     case OPT_FORMAT_CHANGE_COOLDOWN_MS:
+    case OPT_UPSTREAM_IDLE_TIMEOUT_SEC:
     case OPT_UNDERRUN_REBUFFER_PERCENT:
     case OPT_UNDERRUN_REBUFFER_MS:
     case OPT_STARTUP_REAL_DELAY_MS:
@@ -1280,7 +1296,15 @@ int main(int argc, char*argv[]) {
     if (g_shutdown_pending) break;
     if (receiver_data.audio_size == 0 || receiver_data.audio == NULL) {
       // Receiver returned without data (timeout, EINTR, transient producer
-      // gap). Loop and re-check the shutdown flag.
+      // gap). Loop and re-check the shutdown flag. Also tick the Diretta
+      // backend so upstream-idle release can fire even when no packets are
+      // arriving at all (full upstream silence delivers no audio packets,
+      // so diretta_output_send is never called on this branch).
+#if DIRETTA_ENABLE
+      if (output_mode == Diretta) {
+        diretta_output_tick();
+      }
+#endif
       continue;
     }
     /* Backend-independent payload tap. Tapped AFTER the receiver

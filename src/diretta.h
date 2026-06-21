@@ -140,6 +140,15 @@ typedef struct diretta_config_s {
      * cooldown -- only the queue prefill gate. Range 0..5000. */
     int format_change_cooldown_ms;
 
+    /* Upstream-idle release. When the upstream stops sending PCM for this
+     * many seconds, the backend tears down the active Sync (stop +
+     * disconnect + close) so the Diretta Target / DAC stops receiving a
+     * long-term silence stream and can let its USB/ALSA endpoint go idle.
+     * The receiver keeps running; when audio resumes the Sync is reopened
+     * via the existing reconnect path. 0 = disabled (stream silence
+     * forever, the legacy behaviour). Default 120 s. */
+    int upstream_idle_timeout_sec;
+
     /* DSD-specific buffer tuning. Scream signals DSD via sample_size==1.
      * dsd_buffer_ms         : ring size for DSD (default 1500).
      * dsd_prefill_ms        : prefill gate for DSD (default 200).
@@ -306,6 +315,14 @@ int diretta_list_targets(const diretta_config_t *cfg, const char *progname);
 int diretta_output_init(const diretta_config_t *cfg);
 
 int diretta_output_send(receiver_data_t *data);
+
+/* Heartbeat tick called by the receiver loop when no PCM packet was
+ * received this iteration (upstream silent / select() timeout). Runs the
+ * upstream-idle-release check: when the active Sync has been streaming and
+ * no real PCM has arrived for cfg.upstream_idle_timeout_sec, the Sync is
+ * torn down and the reconnect path is armed so playback resumes on the
+ * next packet. No-op when idle release is disabled or no Sync is open. */
+void diretta_output_tick(void);
 
 void diretta_output_shutdown(void);
 

@@ -2808,6 +2808,10 @@ extern "C" void diretta_config_init(diretta_config_t *cfg) {
     // 200 ms has proven sufficient for tested Diretta targets while keeping
     // DSD256/DSD512 format-change accumulation within the DSD ring budget.
     cfg->format_change_cooldown_ms = FORMAT_CHANGE_COOLDOWN_MS_DEFAULT;
+    // Upstream-idle release: tear down the Sync after this many seconds with
+    // no real PCM so the Target stops receiving a long-term silence stream.
+    // 0 = disabled. Default 120 s (2 min).
+    cfg->upstream_idle_timeout_sec = 120;
     // DSD defaults aligned with DRUP / slim2Diretta conventions.
     cfg->dsd_buffer_ms = DSD_BUFFER_MS_DEFAULT;
     cfg->dsd_prefill_ms = DSD_PREFILL_MS_DEFAULT;
@@ -3051,14 +3055,16 @@ extern "C" int diretta_output_init(const diretta_config_t *cfg) {
         "[pipeline] config: pcm_buffer_ms=%d pcm_prefill_ms=%d "
         "rebuffer_percent=%.0f%% underrun_rebuffer_ms=%d (0=use percent) "
         "format_change_cooldown_ms=%d udp_rcvbuf_bytes=%d "
-        "startup_real_delay_ms=%d (0=disabled)\n",
+        "startup_real_delay_ms=%d (0=disabled) "
+        "upstream_idle_timeout_sec=%d (0=disabled)\n",
         g_st.cfg.ring_buffer_ms > 0 ? g_st.cfg.ring_buffer_ms : 1000,
         g_st.cfg.prefill_ms > 0 ? g_st.cfg.prefill_ms : 500,
         g_st.cfg.rebuffer_percent * 100.0f,
         g_st.cfg.underrun_rebuffer_ms,
         effective_cooldown_ms(),
         g_st.cfg.udp_rcvbuf_bytes,
-        g_st.cfg.startup_real_delay_ms);
+        g_st.cfg.startup_real_delay_ms,
+        g_st.cfg.upstream_idle_timeout_sec);
 
     // Warn if PcmRing is too small to absorb the format-change cooldown plus
     // expected SDK open latency. This gives the user a startup warning rather
@@ -3262,6 +3268,47 @@ extern "C" int diretta_output_init(const diretta_config_t *cfg) {
             "[diretta] FATAL: unhandled exception in diretta_output_init; "
             "aborting Diretta backend\n");
         return 1;
+    }
+}
+
+extern "C" void diretta_output_tick(void) {
+    try {
+    if (!g_st.initialized) return;
+    const int timeout_sec = g_st.cfg.upstream_idle_timeout_sec;
+    if (timeout_sec <= 0) return;            // feature disabled
+    if (!g_st.sync) return;                  // no active Sync -> nothing to release
+    if (g_st.reconfigure_pending) return;    // a format change is already in flight
+    if (!g_st.stream_started) return;        // never reached steady playback; let open-grace handle it
+    if (!g_st.have_last_pcm_packet_at) return;
+
+    const auto now_ts = std::chrono::steady_clock::now();
+    const auto idle_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now_ts - g_st.last_pcm_packet_at).count();
+    if (idle_ms < (long long)timeout_sec * 1000LL) return;
+
+    DLOG(0, "upstream idle for %llds (>= %ds); releasing Target "
+         "(stop + disconnect). Will reconnect when audio resumes.",
+         (long long)(idle_ms / 1000), timeout_sec);
+
+    // Mirror the sink-lost teardown: save the format scalars so the
+    // reconnect path can rebuild the same Sync, tear the Sync down, and
+    // arm reconnect_pending. The unified queue is kept so PCM that arrives
+    // on resume accumulates for the next open.
+    const uint32_t saved_rate = g_st.sample_rate;
+    const uint32_t saved_ch   = g_st.channels;
+    const uint32_t saved_bits = g_st.bits_per_sample;
+    const uint32_t saved_bpf  = g_st.bytes_per_frame;
+    teardown_sync_for_runtime("upstream idle release");
+    g_st.reconnect_pending = true;
+    g_st.sample_rate     = saved_rate;
+    g_st.channels        = saved_ch;
+    g_st.bits_per_sample = saved_bits;
+    g_st.bytes_per_frame = saved_bpf;
+    g_st.reconnect_backoff_ms = 500;
+    g_st.next_reconnect_at = now_ts;  // resume as soon as audio returns
+    } catch (...) {
+        std::fprintf(stderr,
+            "[diretta] FATAL: unhandled exception in diretta_output_tick\n");
     }
 }
 
