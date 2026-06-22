@@ -8,7 +8,45 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+---
+
+## [0.5.0] - 2026-06-22
+
+### Summary
+
+Adds upstream-idle handling so the Diretta Target is no longer driven by a
+long-term silence stream when the upstream stops sending PCM: a short-horizon
+**pause** (SDK `stop()`, connection kept) and a longer-horizon **release**
+(full Sync teardown). Also fixes a pre-existing null-pointer crash on
+reconnect that truncated the head of a resumed track. Folds in the
+`--transfer-mode=autofix` / `mode_sdk` logging / `statusUpdate()` cleanup work
+that shipped behind `[Unreleased]` since 0.4.0.
+
 ### Added
+
+- **New `--upstream-pause-timeout-sec` (#1)**. Shorter-horizon companion to
+  `--upstream-idle-timeout-sec`. When the upstream stops sending PCM for this
+  many seconds (default **5**; `0` disables; range 1..600) but has not yet
+  crossed the release threshold, the backend calls SDK `stop()` ("stop
+  playback(pause)") + `deactivate()` to halt the send thread **without**
+  tearing the connection down, so the Target stops being driven while staying
+  warm for an instant resume. On the next real PCM packet the same Sync is
+  replayed (`queue.clear()` + `resetGate()` + `activate()` + `play()`),
+  emitting a short bounded silence run before real PCM, mirroring a fresh
+  open. If the idle persists to `--upstream-idle-timeout-sec` the pause is
+  upgraded to a full release. (`diretta.h`, `diretta.cpp`, `scream.c`)
+
+- **New `--upstream-idle-timeout-sec` (#2)**. When the upstream stops sending
+  PCM for this many seconds (default **120**; `0` disables; range 10..3600)
+  the backend tears the Sync down (`teardown_sync_for_runtime()`: `deactivate`
+  + `stop` + async `disconnect_flgset`/`close`/`delete`), fully stopping all
+  data (including silence) to the Target so its USB/ALSA endpoint can idle.
+  PcmRing is retained and `reconnect_pending` is armed; playback reopens the
+  same-format Sync automatically when audio resumes (shared with the sink-lost
+  reconnect path). Idle detection runs from the receiver-loop heartbeat
+  `diretta_output_tick()` (driven by network.c's 500ms `select()` timeout)
+  since a fully-stopped upstream delivers no UDP packets. (`diretta.h`,
+  `diretta.cpp`, `scream.c`)
 
 - **New `--transfer-mode=autofix`**. A cycle-anchored variant of `auto`
   that preserves the original 0.4.0 `auto + --cycle-time` behaviour:
@@ -51,6 +89,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (`diretta.cpp`)
 
 ### Fixed
+
+- **Reconnect-pending resume null-pointer crash (#3)**. After an idle
+  release (#2), the `diretta_output_send()` reconnect path called
+  `try_reconnect_same_format()` and, on its **success** branch, fell through
+  to `g_st.sync->is_connect()` while `g_st.sync` was still `nullptr` — the
+  reconnect open is asynchronous and the pointer is only installed later by
+  `poll_async_sync_open()`. The resulting SIGSEGV caused a systemd restart
+  that wiped PcmRing, truncating the head of the resumed track (the audible
+  "swallowed beginning"). The success branch now `goto ingress_only` and
+  exits the cycle without assuming the Sync is ready. Pre-existing since
+  a56d547; the #2 idle release made it reliably reproducible. (`diretta.cpp`)
 
 - **Transient cleanup/worker thread no longer inherits SCHED_FIFO 80**.
   On format re-negotiation a short-lived helper thread was spawned by the
