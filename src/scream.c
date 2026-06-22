@@ -141,6 +141,11 @@ static void show_usage(const char *arg0)
   fprintf(stderr, "                               sending PCM for <s> seconds, so it stops receiving a\n");
   fprintf(stderr, "                               long-term silence stream (default 120; 0 disables,\n");
   fprintf(stderr, "                               range 10..3600). Reopens automatically when audio resumes.\n");
+  fprintf(stderr, "  --upstream-pause-timeout-sec <s> Pause the Diretta Target (SDK stop, connection kept)\n");
+  fprintf(stderr, "                               after the upstream stops sending PCM for <s> seconds, so\n");
+  fprintf(stderr, "                               the Target stops being driven but can resume instantly\n");
+  fprintf(stderr, "                               (default 5; 0 disables, range 1..600). Upgrades to a\n");
+  fprintf(stderr, "                               full release at --upstream-idle-timeout-sec.\n");
   fprintf(stderr, "\n");
   fprintf(stderr, "DSD buffering (used when Scream sender signals DSD via sample_size==1):\n");
   fprintf(stderr, "  --dsd-buffer-ms <ms>         DSD ring length in ms (default 1500, range 50..5000).\n");
@@ -264,6 +269,7 @@ enum {
   OPT_DIRETTA_DEBUG,
   OPT_FORMAT_CHANGE_COOLDOWN_MS,
   OPT_UPSTREAM_IDLE_TIMEOUT_SEC,
+  OPT_UPSTREAM_PAUSE_TIMEOUT_SEC,
   OPT_UNDERRUN_REBUFFER_PERCENT,
   OPT_UNDERRUN_REBUFFER_MS,
   OPT_STARTUP_REAL_DELAY_MS,
@@ -323,6 +329,7 @@ static const struct option long_options[] = {
   { "diretta-debug",        no_argument,       0, OPT_DIRETTA_DEBUG },
   { "format-change-cooldown-ms", required_argument, 0, OPT_FORMAT_CHANGE_COOLDOWN_MS },
   { "upstream-idle-timeout-sec", required_argument, 0, OPT_UPSTREAM_IDLE_TIMEOUT_SEC },
+  { "upstream-pause-timeout-sec", required_argument, 0, OPT_UPSTREAM_PAUSE_TIMEOUT_SEC },
   { "underrun-rebuffer-percent", required_argument, 0, OPT_UNDERRUN_REBUFFER_PERCENT },
   { "underrun-rebuffer-ms",      required_argument, 0, OPT_UNDERRUN_REBUFFER_MS },
   { "startup-real-delay-ms",     required_argument, 0, OPT_STARTUP_REAL_DELAY_MS },
@@ -764,6 +771,15 @@ int main(int argc, char*argv[]) {
       dcfg.upstream_idle_timeout_sec = v;
       break;
     }
+    case OPT_UPSTREAM_PAUSE_TIMEOUT_SEC: {
+      int v = atoi(optarg);
+      if (v != 0 && (v < 1 || v > 600)) {
+        fprintf(stderr, "--upstream-pause-timeout-sec must be 0 (disabled) or 1..600\n");
+        return 1;
+      }
+      dcfg.upstream_pause_timeout_sec = v;
+      break;
+    }
     case OPT_UNDERRUN_REBUFFER_PERCENT: {
       double pct = atof(optarg);
       if (pct < 0.0 || pct > 95.0) {
@@ -903,6 +919,7 @@ int main(int argc, char*argv[]) {
     case OPT_DIRETTA_DEBUG:
     case OPT_FORMAT_CHANGE_COOLDOWN_MS:
     case OPT_UPSTREAM_IDLE_TIMEOUT_SEC:
+    case OPT_UPSTREAM_PAUSE_TIMEOUT_SEC:
     case OPT_UNDERRUN_REBUFFER_PERCENT:
     case OPT_UNDERRUN_REBUFFER_MS:
     case OPT_STARTUP_REAL_DELAY_MS:

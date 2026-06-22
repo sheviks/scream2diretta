@@ -149,6 +149,19 @@ typedef struct diretta_config_s {
      * forever, the legacy behaviour). Default 120 s. */
     int upstream_idle_timeout_sec;
 
+    /* Upstream-idle pause. Shorter-horizon companion to
+     * upstream_idle_timeout_sec. When the upstream stops sending PCM for
+     * this many seconds (but less than the release timeout), the backend
+     * calls the SDK stop() (documented as "stop playback(pause)") and
+     * deactivates getNewStream() WITHOUT tearing the connection down, so
+     * the Diretta send thread stops driving the Target while the
+     * connection is kept warm for an instant resume. When real PCM
+     * returns, the same Sync is replayed (queue cleared, startup gates
+     * re-armed, play()) so a short silence precedes real PCM, mirroring a
+     * fresh open. If the idle persists to upstream_idle_timeout_sec the
+     * pause is upgraded to a full release. 0 = disabled. Default 5 s. */
+    int upstream_pause_timeout_sec;
+
     /* DSD-specific buffer tuning. Scream signals DSD via sample_size==1.
      * dsd_buffer_ms         : ring size for DSD (default 1500).
      * dsd_prefill_ms        : prefill gate for DSD (default 200).

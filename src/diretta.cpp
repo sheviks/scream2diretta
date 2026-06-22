@@ -171,6 +171,12 @@ struct DirettaState {
 
     bool reconnect_pending = false;
 
+    // Upstream-idle pause state (#1). True between an idle-pause (SDK
+    // stop() + Sync deactivate(), connection kept) and the resume on the
+    // next real PCM packet. Distinct from reconnect_pending, which means
+    // the Sync was fully torn down (#2 release) and must be reopened.
+    bool paused = false;
+
     // Tail of the latest receive that didn't end on a frame boundary;
     // carried forward into the next push so the queue only ever sees
     // whole frames. Fixed-size buffer — never heap-allocates on the hot
@@ -2202,6 +2208,7 @@ static bool teardown_sync_for_runtime(const char* reason) {
         g_st.have_sink_open_at = false;
         g_st.ever_connected = false;
         g_st.stream_started = false;
+        g_st.paused = false;
         return true;
     }
     scream_diretta::ScreamDirettaSync* old = g_st.sync;
@@ -2216,6 +2223,7 @@ static bool teardown_sync_for_runtime(const char* reason) {
     g_st.have_sink_open_at = false;
     g_st.ever_connected = false;
     g_st.stream_started = false;
+    g_st.paused = false;   // any teardown invalidates the paused-Sync state
     cleanup_sync_async(old, reason);
     return true;
 }
@@ -2812,6 +2820,7 @@ extern "C" void diretta_config_init(diretta_config_t *cfg) {
     // no real PCM so the Target stops receiving a long-term silence stream.
     // 0 = disabled. Default 120 s (2 min).
     cfg->upstream_idle_timeout_sec = 120;
+    cfg->upstream_pause_timeout_sec = 5;
     // DSD defaults aligned with DRUP / slim2Diretta conventions.
     cfg->dsd_buffer_ms = DSD_BUFFER_MS_DEFAULT;
     cfg->dsd_prefill_ms = DSD_PREFILL_MS_DEFAULT;
@@ -3056,7 +3065,8 @@ extern "C" int diretta_output_init(const diretta_config_t *cfg) {
         "rebuffer_percent=%.0f%% underrun_rebuffer_ms=%d (0=use percent) "
         "format_change_cooldown_ms=%d udp_rcvbuf_bytes=%d "
         "startup_real_delay_ms=%d (0=disabled) "
-        "upstream_idle_timeout_sec=%d (0=disabled)\n",
+        "upstream_idle_timeout_sec=%d (0=disabled) "
+        "upstream_pause_timeout_sec=%d (0=disabled)\n",
         g_st.cfg.ring_buffer_ms > 0 ? g_st.cfg.ring_buffer_ms : 1000,
         g_st.cfg.prefill_ms > 0 ? g_st.cfg.prefill_ms : 500,
         g_st.cfg.rebuffer_percent * 100.0f,
@@ -3064,7 +3074,8 @@ extern "C" int diretta_output_init(const diretta_config_t *cfg) {
         effective_cooldown_ms(),
         g_st.cfg.udp_rcvbuf_bytes,
         g_st.cfg.startup_real_delay_ms,
-        g_st.cfg.upstream_idle_timeout_sec);
+        g_st.cfg.upstream_idle_timeout_sec,
+        g_st.cfg.upstream_pause_timeout_sec);
 
     // Warn if PcmRing is too small to absorb the format-change cooldown plus
     // expected SDK open latency. This gives the user a startup warning rather
@@ -3274,9 +3285,10 @@ extern "C" int diretta_output_init(const diretta_config_t *cfg) {
 extern "C" void diretta_output_tick(void) {
     try {
     if (!g_st.initialized) return;
-    const int timeout_sec = g_st.cfg.upstream_idle_timeout_sec;
-    if (timeout_sec <= 0) return;            // feature disabled
-    if (!g_st.sync) return;                  // no active Sync -> nothing to release
+    const int release_sec = g_st.cfg.upstream_idle_timeout_sec;
+    const int pause_sec   = g_st.cfg.upstream_pause_timeout_sec;
+    if (release_sec <= 0 && pause_sec <= 0) return;  // both features disabled
+    if (!g_st.sync) return;                  // no active Sync -> nothing to do
     if (g_st.reconfigure_pending) return;    // a format change is already in flight
     if (!g_st.stream_started) return;        // never reached steady playback; let open-grace handle it
     if (!g_st.have_last_pcm_packet_at) return;
@@ -3284,11 +3296,32 @@ extern "C" void diretta_output_tick(void) {
     const auto now_ts = std::chrono::steady_clock::now();
     const auto idle_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         now_ts - g_st.last_pcm_packet_at).count();
-    if (idle_ms < (long long)timeout_sec * 1000LL) return;
+
+    // Stage 1: pause (#1). Keep the connection but stop the SDK send thread
+    // so the Target stops being driven. Only fires once per idle episode
+    // (guarded by g_st.paused) and only when we have NOT already crossed
+    // the release threshold this tick. The release stage below upgrades a
+    // paused Sync to a full teardown if the idle persists.
+    if (pause_sec > 0 && !g_st.paused &&
+        idle_ms >= (long long)pause_sec * 1000LL &&
+        (release_sec <= 0 || idle_ms < (long long)release_sec * 1000LL)) {
+        DLOG(0, "upstream idle for %llds (>= %ds); pausing Target "
+             "(SDK stop, connection kept). Will resume on next real PCM.",
+             (long long)(idle_ms / 1000), pause_sec);
+        g_st.sync->stop();         // SDK "stop playback(pause)" -- halts send thread
+        g_st.sync->deactivate();   // getNewStream() no longer touches the ring
+        g_st.paused = true;
+        return;
+    }
+
+    // Stage 2: release (#2). Tear the Sync down completely after the longer
+    // idle horizon. Works whether or not we are currently paused.
+    if (release_sec <= 0) return;            // release disabled
+    if (idle_ms < (long long)release_sec * 1000LL) return;
 
     DLOG(0, "upstream idle for %llds (>= %ds); releasing Target "
          "(stop + disconnect). Will reconnect when audio resumes.",
-         (long long)(idle_ms / 1000), timeout_sec);
+         (long long)(idle_ms / 1000), release_sec);
 
     // Mirror the sink-lost teardown: save the format scalars so the
     // reconnect path can rebuild the same Sync, tear the Sync down, and
@@ -3469,6 +3502,24 @@ extern "C" int diretta_output_send(receiver_data_t *data) {
         g_st.partial_frame_len = 0;
     }
 
+    // --- Resume from idle-pause (#1) ---
+    // If we are paused (SDK stopped, connection kept) and a real PCM packet
+    // has arrived, replay the existing Sync mirroring a fresh open: clear
+    // any stale queue content, re-arm the startup gates so getNewStream()
+    // emits a short silence run before real PCM, re-activate ring access,
+    // and play(). A format change above would already have torn the Sync
+    // down (clearing g_st.paused), so this only runs for same-format resume.
+    if (g_st.paused && g_st.sync &&
+        data->audio != nullptr && data->audio_size > 0) {
+        DLOG(0, "upstream resumed; replaying paused Sync "
+             "(queue clear + prefill + play).");
+        g_st.queue.clear();          // drop stale PCM; require fresh prefill
+        g_st.sync->resetGate();      // re-arm mute/prefill/real-delay gates
+        g_st.sync->activate();       // allow getNewStream() to touch the ring
+        g_st.sync->play();           // SDK resume sending
+        g_st.paused = false;
+    }
+
     // --- Unified-queue ingress ---
     // From here on, we always write into g_st.queue (when armed). The Sync
     // either:
@@ -3602,6 +3653,11 @@ extern "C" int diretta_output_send(receiver_data_t *data) {
                     goto ingress_only;
                 }
                 g_st.reconnect_backoff_ms = 750;
+                // The async open was just kicked; g_st.sync is still null
+                // until poll_async_sync_open() installs it on a later call.
+                // Continue queue ingress this cycle instead of falling
+                // through to the g_st.sync->is_connect() deref below.
+                goto ingress_only;
             } else {
                 goto ingress_only;
             }
