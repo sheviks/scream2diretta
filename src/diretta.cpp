@@ -3655,6 +3655,13 @@ extern "C" int diretta_output_send(receiver_data_t *data) {
                 g_st.reconnect_backoff_ms = 750;
                 // The async open was just kicked; g_st.sync is still null
                 // until poll_async_sync_open() installs it on a later call.
+                // Clear reconnect_pending so subsequent ingest cycles do NOT
+                // re-enter this branch and re-call try_reconnect_same_format()
+                // on every packet (which only logs "open already in flight"
+                // until the open lands). The AOS_DoneFail path in
+                // poll_async_sync_open() re-arms reconnect_pending if the
+                // open fails, so dropping it here is safe.
+                g_st.reconnect_pending = false;
                 // Continue queue ingress this cycle instead of falling
                 // through to the g_st.sync->is_connect() deref below.
                 goto ingress_only;
