@@ -14,6 +14,7 @@ ARCHITECTURE_RISKS.md
 DSD_PLAN.md
 DRUP_Diretta_SDK_Optimizations.md
 DirettaRendererUPnP 与 Diretta SDK 的交互机制.md
+s2d_静音流与Target释放问题分析及改进方案.md
 
 # Misc dev scripts
 scream2aac.sh
