@@ -92,13 +92,14 @@ struct DirettaState {
 
     // Last *effective* PCM format we accepted. Only the fields that drive
     // Diretta config are compared (sample_rate, sample_size, channels).
-    uint8_t last_rate_byte = 0;
+    uint32_t last_sample_rate = 0;
     uint8_t last_sample_size = 0;
     uint8_t last_channels = 0;
     bool have_last_fmt = false;
 
     bool sink_active = false;
-    uint32_t bytes_per_frame = 0;
+    uint32_t bytes_per_frame = 0;        // destination bytes/frame (queue / SDK)
+    uint32_t src_bytes_per_frame = 0;    // source bytes/frame from Scream header
     uint32_t sample_rate = 0;
     uint32_t channels = 0;
     uint32_t bits_per_sample = 0;
@@ -113,15 +114,22 @@ struct DirettaState {
     uint32_t dsd_multiplier = 0;   // 1=DSD64, 2=DSD128, 4=DSD256, 8=DSD512
     uint32_t dsd_real_rate = 0;    // e.g. 2822400 for DSD64
 
-    // DSD transformation flags: screamalsa (ALSA DSD_U32_BE) outputs
-    // MSB+BIG byte-interleaved data. ALSA DSD_U32_BE convention places
-    // the DSD bit in the MSB (bit 7) of each byte, i.e. MSB-first.
-    // De-interleave (byte-interleaved -> word-interleaved) is always
-    // required regardless of negotiated format. Bit-reversal is only
-    // needed when the target negotiates a different bit-order (LSB).
+    // DSD transformation flags. The Scream receiver (network.c, pcap_input.c,
+    // shmem.c) is required to deliver DSD in standard ALSA DSD_U32_BE word-
+    // interleaved order; the legacy network path (-L) performs the original
+    // byte-interleaved -> word-interleaved conversion if needed. This backend
+    // only applies the sink-dependent bit-order / byte-order transforms.
+    // ALSA DSD_U32_BE convention places the DSD bit in the MSB (bit 7) of each
+    // byte, i.e. MSB-first / big-endian.
     bool dsd_needs_bit_reverse = false;
     bool dsd_needs_byte_swap = false;
     std::vector<uint8_t> dsd_transform_buffer; // scratch for DSD transform
+
+    // PCM format conversion state.
+    // Diretta SDK has no native S24_LE (4-byte container); screamalsa sends
+    // S24_LE when wire_layout == 1, so we pack it to S24_3LE (3-byte) on ingress.
+    bool pcm_needs_pack_24 = false;
+    std::vector<uint8_t> pcm_pack_buffer; // scratch for S24_LE -> S24_3LE
 
     // Cached cycle values from the last successful open, for stats output.
     uint64_t target_cycle_us = 0;
@@ -557,27 +565,22 @@ constexpr int SINK_OPEN_GRACE_MS = 2000;
 constexpr int SINK_OPEN_GRACE_EXTEND_MS = 500;
 constexpr int SINK_OPEN_GRACE_TOTAL_MS = 8000;
 
-static uint32_t scream_rate_byte_to_hz(uint8_t rb) {
-    uint32_t base = (rb >= 128) ? 44100u : 48000u;
-    uint32_t mult = rb % 128u;
-    if (mult == 0) mult = 1;
-    return base * mult;
-}
-
-static void stats_arm(bool reset_now) {
-    if (g_st.cfg.stats_interval_sec > 0 && stats_should_print()) {
-        auto now = std::chrono::steady_clock::now();
-        g_st.next_stats_print = now + std::chrono::seconds(g_st.cfg.stats_interval_sec);
-        g_st.stats_print_armed = true;
-        (void)reset_now;
+// Split a decoded sample rate (Hz) into base/multiple for FormatID selection.
+// Supports 44.1k/48k families and their power-of-two multiples.
+static void map_rate(uint32_t sample_rate_hz, uint32_t* base, uint32_t* mult) {
+    if (sample_rate_hz % 44100u == 0) {
+        *base = 44100u;
+        *mult = sample_rate_hz / 44100u;
+    } else if (sample_rate_hz % 48000u == 0) {
+        *base = 48000u;
+        *mult = sample_rate_hz / 48000u;
+    } else if (sample_rate_hz == 8000u) {
+        *base = 8000u;
+        *mult = 1;
     } else {
-        g_st.stats_print_armed = false;
+        *base = 0;
+        *mult = 0;
     }
-}
-
-static void map_rate(unsigned char sample_rate, uint32_t* base, uint32_t* mult) {
-    *base = (sample_rate >= 128) ? 44100u : 48000u;
-    *mult = sample_rate % 128u;
     if (*mult == 0) *mult = 1;
 }
 
@@ -634,7 +637,7 @@ static FormatID pcm_id(unsigned char bits) {
 }
 
 // Build a DSD FormatConfigure. Scream signals DSD via sample_size == 1.
-// The wire rate_byte encodes dsd_real_rate / 64 (e.g. rate_byte=1 -> 44100*1 -> DSD64).
+// The container sample_rate is half the real DSD bit rate (e.g. 44100 -> DSD64).
 // We present DSD to the Diretta SDK as 1-bit DSD in a 32-bit container.
 // Returned values are the *container* rate/bits/bpf used for queue sizing:
 //   container_rate = dsd_real_rate / 32
@@ -644,12 +647,13 @@ static bool build_dsd_format(const receiver_format_t& rf, FormatConfigure& out_f
                              uint32_t* out_container_rate, uint32_t* out_channels,
                              uint32_t* out_bits, uint32_t* out_bpf,
                              uint32_t* out_dsd_multiplier, uint32_t* out_dsd_real_rate) {
+    // rf.sample_rate is the ALSA DSD_U32_BE container rate (half the real DSD bit rate).
     uint32_t base = 0, mult = 0;
     map_rate(rf.sample_rate, &base, &mult);
     if (base != 44100u && base != 48000u) return false;
     if (mult == 0) mult = 1;
-    const uint32_t dsd_real_rate = base * mult * 64u;
-    const uint32_t container_rate = dsd_real_rate / 32u;  // "samples" per second in 32-bit words
+    const uint32_t dsd_real_rate = rf.sample_rate * 64u;
+    const uint32_t container_rate = rf.sample_rate;  // ALSA "samples" per second in 32-bit words
     const uint32_t bpf = rf.channels * 4u;
     FormatID ch = channel_id(rf.channels);
     if (ch == FormatID::NONE) return false;
@@ -676,6 +680,7 @@ static bool build_dsd_format(const receiver_format_t& rf, FormatConfigure& out_f
 static bool build_format(const receiver_format_t& rf, FormatConfigure& out_fc,
                          uint32_t* out_rate, uint32_t* out_channels,
                          uint32_t* out_bits, uint32_t* out_bpf) {
+    g_st.pcm_needs_pack_24 = false;
     // DSD sentinel: screamalsa sets sample_size == 1 for DSD_U32_BE.
     if (rf.sample_size == 1) {
         uint32_t dsd_mult = 0, dsd_real = 0;
@@ -703,24 +708,29 @@ static bool build_format(const receiver_format_t& rf, FormatConfigure& out_fc,
     }
     out_fc = FormatConfigure(ch | pc | rb | rm);
     if (!out_fc.isValid()) return false;
-    *out_rate = base * mult;
+    *out_rate = rf.sample_rate;
     *out_channels = rf.channels;
     *out_bits = rf.sample_size;
-    *out_bpf = (rf.sample_size / 8) * rf.channels;
+    // wire_layout distinguishes S24_3LE (3 bytes) from S24_LE (4-byte container).
+    // build_format returns the SOURCE bytes per frame; reconfigure() derives the
+    // queue bytes per frame (Diretta SDK always wants packed 3-byte S24).
+    *out_bpf = scream_bytes_per_sample(&rf) * rf.channels;
     g_st.is_dsd = false;
     g_st.dsd_multiplier = 0;
     g_st.dsd_real_rate = 0;
     g_st.dsd_needs_bit_reverse = false;
     g_st.dsd_needs_byte_swap = false;
+    g_st.pcm_needs_pack_24 = (rf.sample_size == 24 &&
+                              rf.wire_layout == SCREAM_WIRE_S24_LE);
     return true;
 }
 
 // Build a FormatConfigure for a specific bit depth (used during format
-// negotiation fallback).  rate_byte is the Scream header byte (not Hz).
-static bool build_format_with_bits(uint8_t rate_byte, uint32_t channels, uint32_t bits,
+// negotiation fallback).  rate_hz is the decoded sample rate.
+static bool build_format_with_bits(uint32_t rate_hz, uint32_t channels, uint32_t bits,
                                    FormatConfigure& out_fc) {
     uint32_t base = 0, mult = 0;
-    map_rate(rate_byte, &base, &mult);
+    map_rate(rate_hz, &base, &mult);
     FormatID rb = rate_base_id(base);
     FormatID rm = rate_mult_id(mult);
     FormatID ch = channel_id(channels);
@@ -1378,18 +1388,19 @@ static const uint8_t g_bit_reverse_lut[256] = {
     0x0F,0x8F,0x4F,0xCF,0x2F,0xAF,0x6F,0xEF,0x1F,0x9F,0x5F,0xDF,0x3F,0xBF,0x7F,0xFF,
 };
 
-// Transform screamalsa's byte-interleaved DSD output into Diretta SDK's
-// expected word-interleaved format, with optional bit-reversal and byte-swap.
+// Apply negotiated DSD bit-order / byte-order transformations to standard
+// ALSA DSD_U32_BE data.
 //
-// screamalsa convert_data() outputs byte-interleaved [L0 R0 L1 R1 L2 R2 L3 R3]
-// (each byte from a different channel, 4 bytes per 32-bit word per channel).
+// The Scream receiver is required to deliver DSD in standard ALSA DSD_U32_BE
+// frame order: each channel's 4-byte word is contiguous, and channels alternate
+// by word ([L0 L1 L2 L3 R0 R1 R2 R3] for stereo). The legacy network receiver
+// (network.c, -L mode) performs the original byte-interleaved -> word-interleaved
+// conversion if needed, so by the time the data reaches this backend it is always
+// in standard word-interleaved order.
 //
-// Diretta SDK FMT_DSD_SIZ_32 expects word-interleaved [L0 L1 L2 L3 R0 R1 R2 R3]
-// (each channel's 4-byte word is contiguous; channels alternate by word).
-//
-// This function performs the required de-interleave (byte-interleaved ->
-// word-interleaved), plus optional bit-reversal (LSB <-> MSB) and byte-swap
-// (BIG <-> LITTLE) per channel word.
+// This function applies only the target-dependent transformations:
+//   * bit-reversal (LSB <-> MSB) if the sink negotiated LSB-first DSD
+//   * byte-swap (BIG <-> LITTLE) if the sink negotiated little-endian DSD
 static inline void dsd_transform(const uint8_t* src, uint8_t* dst, size_t bytes,
                                  uint32_t channels, bool bit_reverse, bool byte_swap) {
     if (channels == 0 || bytes == 0) return;
@@ -1400,13 +1411,11 @@ static inline void dsd_transform(const uint8_t* src, uint8_t* dst, size_t bytes,
         const uint8_t* s = src + f * bpf;
         uint8_t* d = dst + f * bpf;
         for (uint32_t ch = 0; ch < channels; ++ch) {
-            // Extract this channel's 4 bytes from the byte-interleaved input.
-            // In byte-interleaved format, each channel's bytes are spaced
-            // 'channels' apart: ch=0 gets indices [0,2,4,6], ch=1 gets [1,3,5,7].
-            uint8_t b0 = s[ch + 0 * channels];
-            uint8_t b1 = s[ch + 1 * channels];
-            uint8_t b2 = s[ch + 2 * channels];
-            uint8_t b3 = s[ch + 3 * channels];
+            // Standard DSD_U32_BE: each channel's 4-byte word is contiguous.
+            uint8_t b0 = s[ch * 4 + 0];
+            uint8_t b1 = s[ch * 4 + 1];
+            uint8_t b2 = s[ch * 4 + 2];
+            uint8_t b3 = s[ch * 4 + 3];
 
             if (bit_reverse) {
                 b0 = g_bit_reverse_lut[b0];
@@ -1415,8 +1424,6 @@ static inline void dsd_transform(const uint8_t* src, uint8_t* dst, size_t bytes,
                 b3 = g_bit_reverse_lut[b3];
             }
 
-            // Write the channel's word contiguously in the output (word-interleaved).
-            // d[ch*4 + 0..3] holds this channel's 32-bit word.
             if (byte_swap) {
                 d[ch * 4 + 0] = b3;
                 d[ch * 4 + 1] = b2;
@@ -1432,27 +1439,58 @@ static inline void dsd_transform(const uint8_t* src, uint8_t* dst, size_t bytes,
     }
 }
 
+// Pack S24_LE (4-byte little-endian container, 24-bit sample in low 3 bytes)
+// into S24_3LE (packed 3-byte little-endian). Diretta SDK only exposes packed
+// 24-bit PCM (FMT_PCM_SIGNED_24), so screamalsa's S24_LE wire_layout must be
+// converted before queue ingress.
+static inline void pcm_pack_24le(const uint8_t* src, uint8_t* dst, size_t bytes,
+                                 uint32_t src_bpf, uint32_t channels) {
+    if (channels == 0 || src_bpf == 0 || bytes == 0) return;
+    const uint32_t dst_bpf = channels * 3;
+    const size_t num_frames = bytes / src_bpf;
+    for (size_t f = 0; f < num_frames; ++f) {
+        const uint8_t* s = src + f * src_bpf;
+        uint8_t* d = dst + f * dst_bpf;
+        for (uint32_t ch = 0; ch < channels; ++ch) {
+            // S24_LE: low 3 bytes of a 32-bit LE word carry the sample.
+            d[ch * 3 + 0] = s[ch * 4 + 0];
+            d[ch * 3 + 1] = s[ch * 4 + 1];
+            d[ch * 3 + 2] = s[ch * 4 + 2];
+        }
+    }
+}
+
 // Wrapper around queue_push_frames that performs DSD bit-reversal /
-// byte-swap / de-interleave when the target requires it.
-// Ingress PCM down-conversion was removed: negotiate_sink_format() now
-// refuses connections where the DAC cannot accept the source bit depth,
-// so src_bpf is always equal to dst_bpf on the PCM path.
+// byte-swap, or S24_LE -> S24_3LE packing, when required.
 // src_bpf  = bytes per frame of the SOURCE data (Scream header format)
-// dst_bpf  = bytes per frame of the TARGET data (== src_bpf for PCM)
+// dst_bpf  = bytes per frame of the TARGET data (queue / SDK format)
 static inline void queue_push_frames_converted(const uint8_t* data, size_t bytes,
                                                uint32_t src_bpf, uint32_t dst_bpf) {
-    (void)src_bpf;
     if (!g_st.queue_ready || dst_bpf == 0 || bytes == 0) return;
 
-    // DSD transformation path: screamalsa outputs byte-interleaved DSD
-    // ([L0 R0 L1 R1 ...]), but Diretta SDK expects word-interleaved
-    // ([L0 L1 L2 L3 R0 R1 R2 R3 ...]). De-interleave is always required.
-    // Bit-reversal and byte-swap are applied per channel word when needed.
+    // DSD transformation path: the Scream receiver delivers standard ALSA
+    // DSD_U32_BE word-interleaved data. The legacy network path (-L) already
+    // converts original byte-interleaved DSD to this standard order. Here we
+    // only apply the sink-dependent bit-order / byte-order transforms.
     if (g_st.is_dsd) {
         g_st.dsd_transform_buffer.resize(bytes);
         dsd_transform(data, g_st.dsd_transform_buffer.data(), bytes, g_st.channels,
                       g_st.dsd_needs_bit_reverse, g_st.dsd_needs_byte_swap);
         queue_push_frames(g_st.dsd_transform_buffer.data(), bytes, dst_bpf);
+        return;
+    }
+
+    // S24_LE -> S24_3LE packing. Diretta SDK has no native 4-byte 24-bit
+    // container; drop the padding byte from each sample.
+    if (g_st.pcm_needs_pack_24) {
+        if (src_bpf == 0) return;
+        const size_t whole_frames = bytes / src_bpf;
+        const size_t out_bytes = whole_frames * dst_bpf;
+        if (out_bytes == 0) return;
+        g_st.pcm_pack_buffer.resize(out_bytes);
+        pcm_pack_24le(data, g_st.pcm_pack_buffer.data(), whole_frames * src_bpf,
+                      src_bpf, g_st.channels);
+        queue_push_frames(g_st.pcm_pack_buffer.data(), out_bytes, dst_bpf);
         return;
     }
 
@@ -1602,8 +1640,9 @@ static uint32_t open_sync_worker_blocking(scream_diretta::ScreamDirettaSync*& ou
         accepted_bits = 32;  // DSD uses 32-bit container internally
 
         // Determine if the target needs bit-reversal or byte-swap relative to
-        // screamalsa's output. ALSA DSD_U32_BE places the DSD bit in the MSB
-        // (bit 7) of each byte, i.e. the source is MSB+BIG.
+        // the Scream receiver's DSD_U32_BE output. Standard ALSA DSD_U32_BE
+        // places the DSD bit in the MSB (bit 7) of each byte, i.e. the source
+        // is MSB+BIG.
         const bool target_is_lsb    = (negotiated_dsd_fmt & FormatID::FMT_DSD_LSB) != FormatID(0);
         const bool target_is_msb    = (negotiated_dsd_fmt & FormatID::FMT_DSD_MSB) != FormatID(0);
         const bool target_is_little = (negotiated_dsd_fmt & FormatID::FMT_DSD_LITTLE) != FormatID(0);
@@ -1947,7 +1986,10 @@ static void finalize_sync_open_on_receiver(scream_diretta::ScreamDirettaSync* sy
                     g_st.dbg_logged_first_push_during_open_grace ? 1 : 0);
     }
     g_st.sink_active = true;
-    {
+    // bytes_per_frame was set in reconfigure() to the destination frame size
+    // (e.g. packed 3-byte for S24_LE). Recompute only when there is no source-
+    // to-queue conversion in progress; otherwise leave the conversion state alone.
+    if (!g_st.pcm_needs_pack_24) {
         uint32_t bps = g_st.bits_per_sample / 8;
         g_st.bytes_per_frame = bps * g_st.channels;
     }
@@ -2147,6 +2189,7 @@ static void teardown_sync_for_shutdown() {
     g_st.sync = nullptr;
     g_st.sink_active = false;
     g_st.bytes_per_frame = 0;
+    g_st.src_bytes_per_frame = 0;
     g_st.partial_frame_len = 0;
 }
 
@@ -2204,6 +2247,7 @@ static bool teardown_sync_for_runtime(const char* reason) {
     if (!g_st.sync) {
         g_st.sink_active = false;
         g_st.bytes_per_frame = 0;
+        g_st.src_bytes_per_frame = 0;
         g_st.partial_frame_len = 0;
         g_st.have_sink_open_at = false;
         g_st.ever_connected = false;
@@ -2219,6 +2263,7 @@ static bool teardown_sync_for_runtime(const char* reason) {
     g_st.sync = nullptr;
     g_st.sink_active = false;
     g_st.bytes_per_frame = 0;
+    g_st.src_bytes_per_frame = 0;
     g_st.partial_frame_len = 0;
     g_st.have_sink_open_at = false;
     g_st.ever_connected = false;
@@ -2247,10 +2292,17 @@ static bool reconfigure(const receiver_format_t& rf) {
     FormatConfigure fc;
     uint32_t rate = 0, ch = 0, bits = 0, bpf = 0;
     if (!validate_format(rf, fc, &rate, &ch, &bits, &bpf)) {
-        DLOG(0, "unsupported scream format: rate_byte=0x%02x size=%u ch=%u",
+        DLOG(0, "unsupported scream format: rate=%u Hz size=%u ch=%u",
              rf.sample_rate, rf.sample_size, rf.channels);
         return false;
     }
+    // SOURCE bytes per frame from the Scream header (e.g. 8 for stereo S24_LE).
+    const uint32_t src_bpf = bpf;
+    // DESTINATION bytes per frame for the queue / SDK. Diretta SDK only has
+    // packed S24_3LE, so S24_LE is converted on ingress and the queue stores
+    // 3 bytes per sample regardless of wire_layout.
+    const uint32_t dst_bpf = (g_st.pcm_needs_pack_24) ? (3 * ch) : src_bpf;
+
     // First open in this session has no previous stream to release.
     // For first-open we skip the format-change cooldown entirely (cooldown=0)
     // so the unified queue does not have to absorb 1.2 s of PCM before the
@@ -2267,19 +2319,20 @@ static bool reconfigure(const receiver_format_t& rf) {
         DLOG(1, "format change accepted: DSD (real_rate=%u Hz, mult=%u) container=%u Hz, %u-bit, %u ch (bpf=%u) "
              "[first_open=%d cooldown_ms=%d]",
              g_st.dsd_real_rate, g_st.dsd_multiplier,
-             rate, bits, ch, bpf, is_first_open ? 1 : 0, cooldown_ms);
+             rate, bits, ch, dst_bpf, is_first_open ? 1 : 0, cooldown_ms);
     } else {
-        DLOG(1, "format change accepted: %u Hz, %u-bit, %u ch (bpf=%u) "
+        DLOG(1, "format change accepted: %u Hz, %u-bit, %u ch (src_bpf=%u dst_bpf=%u pack24=%d) "
              "[first_open=%d cooldown_ms=%d]",
-             rate, bits, ch, bpf, is_first_open ? 1 : 0, cooldown_ms);
+             rate, bits, ch, src_bpf, dst_bpf, g_st.pcm_needs_pack_24 ? 1 : 0,
+             is_first_open ? 1 : 0, cooldown_ms);
     }
     // Reset the global phase-trace anchor so every event after this point
     // is timestamped relative to "format change accepted".
     dbg_set_anchor();
     dbg_event("format_change_accepted",
-              "rate_hz=%u bits=%u channels=%u bpf=%u first_open=%d cooldown_ms=%d "
+              "rate_hz=%u bits=%u channels=%u src_bpf=%u dst_bpf=%u pack24=%d first_open=%d cooldown_ms=%d "
               "open_gate_max_wait_ms=%d dsd=%d dsd_mult=%u dsd_real_rate=%u",
-              rate, bits, ch, bpf,
+              rate, bits, ch, src_bpf, dst_bpf, g_st.pcm_needs_pack_24 ? 1 : 0,
               is_first_open ? 1 : 0, cooldown_ms, OPEN_GATE_MAX_WAIT_MS,
               g_st.is_dsd ? 1 : 0, g_st.dsd_multiplier, g_st.dsd_real_rate);
 
@@ -2306,7 +2359,8 @@ static bool reconfigure(const receiver_format_t& rf) {
     g_st.sample_rate = rate;
     g_st.channels = ch;
     g_st.bits_per_sample = bits;
-    g_st.bytes_per_frame = bpf;
+    g_st.bytes_per_frame = dst_bpf;
+    g_st.src_bytes_per_frame = src_bpf;
     g_st.last_fc = fc;
     g_st.have_last_fc = true;
     g_st.format_changes.fetch_add(1, std::memory_order_relaxed);
@@ -2333,7 +2387,7 @@ static bool reconfigure(const receiver_format_t& rf) {
     // into this queue directly; the SDK Sync will read from the same
     // queue once it's open. configure_unified_queue() also computes
     // the open-gate fill threshold for the new format.
-    configure_unified_queue(rate, ch, bits / 8, bpf, silence_byte);
+    configure_unified_queue(rate, ch, bits / 8, dst_bpf, silence_byte);
 
     // Re-arm the ingress startup analyser for the new format. The
     // egress analyser and fader are armed inside configureFormat() of the
@@ -2345,7 +2399,9 @@ static bool reconfigure(const receiver_format_t& rf) {
     // comparator captures the first compare_ingress_taps_ms ms of bytes
     // on each side; format change resets both buffers so the user gets
     // one summary line per format (matches the ingress analyser).
-    cmp_rearm_for_format(rate, ch, bits, bpf);
+    // The raw-entry side observes the source wire format, so use src_bpf
+    // (S24_LE stays 4 bytes per sample there; ingress side sees packed 3-byte).
+    cmp_rearm_for_format(rate, ch, bits, src_bpf);
 
     const int active_ring_ms = g_st.is_dsd
         ? (g_st.cfg.dsd_buffer_ms > 0 ? g_st.cfg.dsd_buffer_ms : DSD_BUFFER_MS_DEFAULT)
@@ -3272,7 +3328,7 @@ extern "C" int diretta_output_init(const diretta_config_t *cfg) {
 
     g_st.sdk_open = true;
     g_st.initialized = true;
-    stats_arm(true);
+    g_st.stats_print_armed = true;
     return 0;
     } catch (...) {
         std::fprintf(stderr,
@@ -3331,12 +3387,14 @@ extern "C" void diretta_output_tick(void) {
     const uint32_t saved_ch   = g_st.channels;
     const uint32_t saved_bits = g_st.bits_per_sample;
     const uint32_t saved_bpf  = g_st.bytes_per_frame;
+    const uint32_t saved_src_bpf = g_st.src_bytes_per_frame;
     teardown_sync_for_runtime("upstream idle release");
     g_st.reconnect_pending = true;
     g_st.sample_rate     = saved_rate;
     g_st.channels        = saved_ch;
     g_st.bits_per_sample = saved_bits;
     g_st.bytes_per_frame = saved_bpf;
+    g_st.src_bytes_per_frame = saved_src_bpf;
     g_st.reconnect_backoff_ms = 500;
     g_st.next_reconnect_at = now_ts;  // resume as soon as audio returns
     } catch (...) {
@@ -3389,7 +3447,7 @@ extern "C" int diretta_output_send(receiver_data_t *data) {
         // of the Diretta path's reconfiguration state. Only valid
         // bit-depth values open a file (matches raw.c's accept set).
         const receiver_format_t& rf_now = data->format;
-        const uint32_t rate_hz = scream_rate_byte_to_hz(rf_now.sample_rate);
+        const uint32_t rate_hz = rf_now.sample_rate;
         const uint32_t bits    = rf_now.sample_size;
         const uint32_t chans   = rf_now.channels;
         if (rate_hz > 0 && (bits == 16 || bits == 24 || bits == 32) &&
@@ -3447,7 +3505,7 @@ extern "C" int diretta_output_send(receiver_data_t *data) {
 
     const bool effective_fmt_changed =
         !g_st.have_last_fmt ||
-        rf.sample_rate != g_st.last_rate_byte ||
+        rf.sample_rate != g_st.last_sample_rate ||
         rf.sample_size != g_st.last_sample_size ||
         rf.channels    != g_st.last_channels;
 
@@ -3458,39 +3516,38 @@ extern "C" int diretta_output_send(receiver_data_t *data) {
             // Spurious / sentinel packet on stop/resume. Drop without
             // touching the SDK.
             g_st.spurious_format_packets.fetch_add(1, std::memory_order_relaxed);
-            DLOG(2, "ignoring spurious format packet: rate_byte=0x%02x size=%u ch=%u",
+            DLOG(2, "ignoring spurious format packet: rate=%u Hz size=%u ch=%u",
                  rf.sample_rate, rf.sample_size, rf.channels);
             maybe_print_periodic_stats();
             return 0;
         }
         if (g_st.have_last_fmt) {
             if (g_st.is_dsd) {
+                uint32_t new_base = 0, new_mult = 0;
+                map_rate(rf.sample_rate, &new_base, &new_mult);
                 DLOG(1, "format change: DSD (real_rate=%u Hz, mult=%u) -> "
                      "DSD (real_rate=%u Hz, mult=%u)",
                      g_st.dsd_real_rate, g_st.dsd_multiplier,
-                     g_st.dsd_real_rate, g_st.dsd_multiplier);
+                     rf.sample_rate * 64u, new_mult);
             } else {
-                DLOG(1, "format change: %u Hz / %u-bit / %u ch (rate_byte=0x%02x) -> "
-                     "%u Hz / %u-bit / %u ch (rate_byte=0x%02x)",
-                     scream_rate_byte_to_hz(g_st.last_rate_byte),
-                     g_st.last_sample_size, g_st.last_channels, g_st.last_rate_byte,
-                     scream_rate_byte_to_hz(rf.sample_rate),
-                     rf.sample_size, rf.channels, rf.sample_rate);
+                DLOG(1, "format change: %u Hz / %u-bit / %u ch -> "
+                     "%u Hz / %u-bit / %u ch",
+                     g_st.last_sample_rate, g_st.last_sample_size, g_st.last_channels,
+                     rf.sample_rate, rf.sample_size, rf.channels);
             }
         } else {
             if (rf.sample_size == 1) {
                 uint32_t dsd_base = 0, dsd_mult = 0;
                 map_rate(rf.sample_rate, &dsd_base, &dsd_mult);
                 uint32_t dsd_real = dsd_base * dsd_mult * 64u;
-                DLOG(1, "initial format: DSD (real_rate=%u Hz, mult=%u, rate_byte=0x%02x)",
-                     dsd_real, dsd_mult, rf.sample_rate);
+                DLOG(1, "initial format: DSD (real_rate=%u Hz, mult=%u)",
+                     dsd_real, dsd_mult);
             } else {
-                DLOG(1, "initial format: %u Hz / %u-bit / %u ch (rate_byte=0x%02x)",
-                     scream_rate_byte_to_hz(rf.sample_rate),
-                     rf.sample_size, rf.channels, rf.sample_rate);
+                DLOG(1, "initial format: %u Hz / %u-bit / %u ch",
+                     rf.sample_rate, rf.sample_size, rf.channels);
             }
         }
-        g_st.last_rate_byte = rf.sample_rate;
+        g_st.last_sample_rate = rf.sample_rate;
         g_st.last_sample_size = rf.sample_size;
         g_st.last_channels = rf.channels;
         g_st.have_last_fmt = true;
@@ -3772,21 +3829,21 @@ extern "C" int diretta_output_send(receiver_data_t *data) {
             g_st.startup_real_delay_pushed_at_begin = g_st.sync->pushedBytes();
             g_st.startup_real_delay_popped_at_begin = g_st.sync->poppedBytes();
             phase_event("startup_real_delay_begin",
-                        "delay_ms=%d target_bytes=%zu queue_fill=%zu/%zu B "
+                        "delay_ms=%d target_bytes=%llu queue_fill=%llu/%llu B "
                         "(~%llu ms) popped_so_far=%llu (queue NOT consumed during delay)",
                         g_st.cfg.startup_real_delay_ms,
-                        rd_target,
-                        g_st.startup_real_delay_queue_fill_at_begin,
-                        g_st.queue_ready ? g_st.queue.capacity() : 0,
+                        (unsigned long long)rd_target,
+                        (unsigned long long)g_st.startup_real_delay_queue_fill_at_begin,
+                        (unsigned long long)(g_st.queue_ready ? g_st.queue.capacity() : 0),
                         (unsigned long long)g_st.sync->ringFillMs(),
                         (unsigned long long)g_st.startup_real_delay_popped_at_begin);
             dbg_event("startup_real_delay_begin",
-                      "delay_ms=%d target_bytes=%zu queue_fill=%zu/%zu B "
+                      "delay_ms=%d target_bytes=%llu queue_fill=%llu/%llu B "
                       "(~%llu ms) popped_so_far=%llu",
                       g_st.cfg.startup_real_delay_ms,
-                      rd_target,
-                      g_st.startup_real_delay_queue_fill_at_begin,
-                      g_st.queue_ready ? g_st.queue.capacity() : 0,
+                      (unsigned long long)rd_target,
+                      (unsigned long long)g_st.startup_real_delay_queue_fill_at_begin,
+                      (unsigned long long)(g_st.queue_ready ? g_st.queue.capacity() : 0),
                       (unsigned long long)g_st.sync->ringFillMs(),
                       (unsigned long long)g_st.startup_real_delay_popped_at_begin);
         }
@@ -3885,12 +3942,14 @@ extern "C" int diretta_output_send(receiver_data_t *data) {
                 const uint32_t saved_ch   = g_st.channels;
                 const uint32_t saved_bits = g_st.bits_per_sample;
                 const uint32_t saved_bpf  = g_st.bytes_per_frame;
+                const uint32_t saved_src_bpf = g_st.src_bytes_per_frame;
                 teardown_sync_for_runtime("open-grace exhausted");
                 g_st.reconnect_pending = true;
                 g_st.sample_rate = saved_rate;
                 g_st.channels = saved_ch;
                 g_st.bits_per_sample = saved_bits;
                 g_st.bytes_per_frame = saved_bpf;
+                g_st.src_bytes_per_frame = saved_src_bpf;
                 // The queue is kept — PCM continues to accumulate for the
                 // next Sync open.
                 g_st.next_reconnect_at = now_ts +
@@ -3912,12 +3971,14 @@ extern "C" int diretta_output_send(receiver_data_t *data) {
             const uint32_t saved_ch   = g_st.channels;
             const uint32_t saved_bits = g_st.bits_per_sample;
             const uint32_t saved_bpf  = g_st.bytes_per_frame;
+            const uint32_t saved_src_bpf = g_st.src_bytes_per_frame;
             teardown_sync_for_runtime("sink lost");
             g_st.reconnect_pending = true;
             g_st.sample_rate = saved_rate;
             g_st.channels = saved_ch;
             g_st.bits_per_sample = saved_bits;
             g_st.bytes_per_frame = saved_bpf;
+            g_st.src_bytes_per_frame = saved_src_bpf;
             // Keep the queue alive across the sink-lost: subsequent PCM
             // accumulates for the next open.
             const bool backoff_elapsed = (now_ts >= g_st.next_reconnect_at);
@@ -4024,12 +4085,11 @@ ingress_only:
     // destination.
     if (g_st.queue_ready) {
         const uint32_t dst_bpf = g_st.queue_bpf;
-        const uint32_t src_bpf = g_st.bytes_per_frame;
-        // src_bpf == dst_bpf for the PCM path (ingress down-conversion was
-        // removed; negotiate_sink_format() refuses unsupported bit depths).
-        // The DSD path still re-arranges bytes inside queue_push_frames_converted
-        // but keeps the same frame size.
-        if (dst_bpf == 0 || dst_bpf > PARTIAL_FRAME_MAX || g_st.bytes_per_frame != dst_bpf) {
+        const uint32_t src_bpf = g_st.src_bytes_per_frame;
+        // src_bpf == dst_bpf for ordinary PCM. They differ when the source
+        // is S24_LE (4-byte container) and we must pack to S24_3LE (3-byte)
+        // for the Diretta SDK.
+        if (src_bpf == 0 || dst_bpf == 0 || dst_bpf > PARTIAL_FRAME_MAX) {
             // Format scalars and queue bpf must agree — defensive.
         } else {
             const uint8_t* src = data->audio;

@@ -12,8 +12,9 @@
 #define DEFAULT_MULTICAST_GROUP "239.255.77.77"
 #define DEFAULT_PORT 4010
 
-#define HEADER_SIZE 5
-#define MAX_SO_PACKETSIZE 1152+HEADER_SIZE
+#define HEADER_SIZE 6
+#define LEGACY_HEADER_SIZE 5
+#define MAX_SO_PACKETSIZE (1152+HEADER_SIZE)
 
 typedef struct rctx_network {
   int sockfd;
@@ -38,11 +39,15 @@ typedef struct rctx_network {
  *
  * enable_nic_timestamp != 0 turns on SO_TIMESTAMPNS so each packet
  * arrives with the kernel's NIC-receive timestamp; it is exposed via
- * receiver_data_t::nic_timestamp_ns for downstream stats. */
+ * receiver_data_t::nic_timestamp_ns for downstream stats.
+ *
+ * legacy != 0 selects the original 5-byte Scream header instead of the
+ * extended 6-byte ScreamALSA header. */
 int init_network(enum receiver_type receiver_mode, in_addr_t interface, int port,
                  char* multicast_group, int udp_rcvbuf_bytes,
                  const char* allowed_source_ip,
-                 int udp_busy_poll_us, int enable_nic_timestamp);
+                 int udp_busy_poll_us, int enable_nic_timestamp,
+                 int legacy);
 void rcv_network(receiver_data_t* receiver_data);
 
 #endif

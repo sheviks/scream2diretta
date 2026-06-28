@@ -33,6 +33,7 @@ int pulse_output_init(int latency, int max_latency, char *sink, char *stream_nam
   po_data.receiver_format.sample_size = 0;
   po_data.receiver_format.channels = 2;
   po_data.receiver_format.channel_map = 0x0003;
+  po_data.receiver_format.wire_layout = 0;
 
   po_data.latency = latency;
   po_data.max_latency = max_latency;
@@ -81,11 +82,23 @@ int pulse_output_send(receiver_data_t *data)
     memcpy(&po_data.receiver_format, rf, sizeof(receiver_format_t));
 
     po_data.ss.channels = rf->channels;
-    po_data.ss.rate = ((rf->sample_rate >= 128) ? 44100 : 48000) * (rf->sample_rate % 128);
+    /* sample_rate field holds decoded value (extended encoding) */
+    po_data.ss.rate = rf->sample_rate;
     switch (rf->sample_size) {
       case 16: po_data.ss.format = PA_SAMPLE_S16LE; break;
-      case 24: po_data.ss.format = PA_SAMPLE_S24LE; break;
+      case 24:
+        if (rf->wire_layout == SCREAM_WIRE_S24_LE) {
+          po_data.ss.format = PA_SAMPLE_S24_32LE; /* 24-bit in 32-bit container (4 bytes) */
+        } else {
+          po_data.ss.format = PA_SAMPLE_S24LE;    /* packed 24-bit (3 bytes) */
+        }
+        break;
       case 32: po_data.ss.format = PA_SAMPLE_S32LE; break;
+      case 1:
+        /* DSD not supported via pa_simple in a simple way; fall through to unsupported */
+        printf("DSD (sample_size=1) not supported with PulseAudio output.\n");
+        po_data.ss.rate = 0;
+        break;
       default:
         printf("Unsupported sample size %hhu, not playing until next format switch.\n", rf->sample_size);
         po_data.ss.rate = 0;

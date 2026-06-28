@@ -32,11 +32,12 @@ int sndio_output_send(receiver_data_t *data)
       sio_stop(h);
     sio_initpar(&p);
     p.bits = rf->sample_size;
-    p.bps = SIO_BPS(p.bits);
+    p.bps = (rf->sample_size == 24) ? scream_bytes_per_sample(rf) : SIO_BPS(p.bits);
     p.sig = p.bits > 8;
     p.le = 1;
     p.pchan = rf->channels;
-    p.rate = ((rf->sample_rate >= 128) ? 44100 : 48000) * (rf->sample_rate % 128);
+    /* sample_rate field holds decoded value (extended encoding) */
+    p.rate = rf->sample_rate;
     p.appbufsz = p.rate * latency_ms / 1000;
     p.xrun = SIO_IGNORE;
     if (!sio_setpar(h, &p)) {

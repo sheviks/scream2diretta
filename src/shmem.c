@@ -72,10 +72,11 @@ void rcv_shmem(receiver_data_t* receiver_data)
     rctx_shmem.read_idx = mod((header->write_idx-1), header->max_chunks);
   }
 
-  receiver_data->format.sample_rate = header->sample_rate;
+  receiver_data->format.sample_rate = scream_decode_rate_legacy(header->sample_rate);
   receiver_data->format.sample_size = header->sample_size;
   receiver_data->format.channels = header->channels;
   receiver_data->format.channel_map = header->channel_map;
+  receiver_data->format.wire_layout = 0;
 
   receiver_data->audio_size = header->chunk_size;
   receiver_data->audio = &rctx_shmem.mmap[header->offset+header->chunk_size*rctx_shmem.read_idx];

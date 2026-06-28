@@ -7,12 +7,15 @@
 #include <time.h>
 
 static rctx_network_t rctx_network;
+static int legacy_mode = 0;
 
 int init_network(enum receiver_type receiver_mode, in_addr_t interface, int port,
                  char* multicast_group, int udp_rcvbuf_bytes,
                  const char* allowed_source_ip,
-                 int udp_busy_poll_us, int enable_nic_timestamp)
+                 int udp_busy_poll_us, int enable_nic_timestamp,
+                 int legacy)
 {
+  legacy_mode = legacy;
   rctx_network.sockfd = socket(AF_INET, SOCK_DGRAM, 0);
   if (rctx_network.sockfd < 0) {
     perror("Failed to craete socket");
@@ -156,19 +159,43 @@ int init_network(enum receiver_type receiver_mode, in_addr_t interface, int port
   return 0;
 }
 
+/* Original Scream / ap2renderer sends DSD with left/right bytes interleaved
+ * per 8-byte frame. Standard ALSA DSD_U32_BE expects each channel's 4 bytes
+ * contiguous. This reverses the original driver-side convert_data() transform.
+ */
+static void dsd_legacy_deinterleave(char *src, size_t bytes)
+{
+  size_t frames = bytes / 8;
+  while (frames--) {
+    char tmp[8];
+    /* incoming: [L0][R0][L1][R1][L2][R2][L3][R3] */
+    tmp[0] = src[0];
+    tmp[1] = src[2];
+    tmp[2] = src[4];
+    tmp[3] = src[6];
+    tmp[4] = src[1];
+    tmp[5] = src[3];
+    tmp[6] = src[5];
+    tmp[7] = src[7];
+    memcpy(src, tmp, 8);
+    src += 8;
+  }
+}
+
 void rcv_network(receiver_data_t* receiver_data)
 {
   ssize_t n = 0;
   receiver_data->audio_size = 0;
   receiver_data->audio = NULL;
   receiver_data->nic_timestamp_ns = 0;
+  const size_t hdr_size = legacy_mode ? LEGACY_HEADER_SIZE : HEADER_SIZE;
 
   // Use select() with a 500ms timeout so the receiver loop can observe a
   // pending shutdown even if no audio packets are flowing. recvfrom() with
   // an installed SIGINT handler would otherwise simply return EINTR and we
   // used to loop on that without checking the shutdown flag, which made
   // Ctrl-C ineffective.
-  while (n < HEADER_SIZE) {
+  while (n < (ssize_t)hdr_size) {
     if (g_shutdown_pending) return;
 
     fd_set rfds;
@@ -255,11 +282,45 @@ void rcv_network(receiver_data_t* receiver_data)
 #endif
     }
   }
-  receiver_data->format.sample_rate = rctx_network.buf[0];
+  if (legacy_mode) {
+    /* Original 5-byte Scream header:
+     * byte[0]: rate code
+     * byte[1]: sample size
+     * byte[2]: channels
+     * byte[3]: channel map low byte
+     * byte[4]: channel map high byte
+     */
+    receiver_data->format.sample_rate = scream_decode_rate_legacy(rctx_network.buf[0]);
+    receiver_data->format.sample_size = rctx_network.buf[1];
+    receiver_data->format.channels = rctx_network.buf[2];
+    receiver_data->format.channel_map = (rctx_network.buf[4] << 8) | rctx_network.buf[3];
+    receiver_data->format.wire_layout = 0;
+    receiver_data->audio_size = (n > LEGACY_HEADER_SIZE) ? (n - LEGACY_HEADER_SIZE) : 0;
+    receiver_data->audio = &rctx_network.buf[LEGACY_HEADER_SIZE];
+
+    /* Original Scream/ap2renderer DSD is byte-interleaved per frame.
+     * Convert to standard ALSA DSD_U32_BE frame order on the fly.
+     */
+    if (receiver_data->format.sample_size == 1 && receiver_data->audio_size >= 8) {
+      dsd_legacy_deinterleave((char*)receiver_data->audio, receiver_data->audio_size);
+    }
+    return;
+  }
+
+  /* Extended 6-byte ScreamALSA header:
+   * byte[0]: rate low 8 bits
+   * byte[1]: sample size
+   * byte[2]: channels
+   * byte[3]: channel map low byte
+   * byte[4]: rate high 4 bits + 44.1k flag + end-of-track flag
+   * byte[5]: wire_layout (only meaningful for 24-bit PCM)
+   */
+  receiver_data->format.sample_rate = scream_decode_rate(rctx_network.buf[0], rctx_network.buf[4]);
   receiver_data->format.sample_size = rctx_network.buf[1];
   receiver_data->format.channels = rctx_network.buf[2];
-  receiver_data->format.channel_map = (rctx_network.buf[4] << 8) | rctx_network.buf[3];
-  receiver_data->audio_size = n - HEADER_SIZE;
-  receiver_data->audio = &rctx_network.buf[5];
+  receiver_data->format.channel_map = rctx_network.buf[3];
+  receiver_data->format.wire_layout = rctx_network.buf[5];
+  receiver_data->audio_size = (n > HEADER_SIZE) ? (n - HEADER_SIZE) : 0;
+  receiver_data->audio = &rctx_network.buf[HEADER_SIZE];
 }
 
