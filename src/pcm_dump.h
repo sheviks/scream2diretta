@@ -87,13 +87,6 @@ size_t pcm_dumper_write(pcm_dumper_t* d, const void* data, size_t bytes);
 // Flush + close + fix up the WAV header. Safe to call on a closed dumper.
 void pcm_dumper_close(pcm_dumper_t* d);
 
-// Returns 1 if a file is currently open AND the cap has not yet fired.
-int  pcm_dumper_is_writing(const pcm_dumper_t* d);
-
-// Returns 1 if the cap has been hit for the current open. Once true, no
-// further writes go through until a format change re-opens the file.
-int  pcm_dumper_cap_reached(const pcm_dumper_t* d);
-
 #ifdef __cplusplus
 }
 #endif

@@ -201,8 +201,6 @@ struct DirettaState {
     // Producer-side stats not already tracked inside PcmRing.
     std::atomic<uint64_t> partial_carry_count{0};
     std::atomic<uint64_t> format_changes{0};
-    std::atomic<uint64_t> oversize_format_rejects{0};
-    std::atomic<uint64_t> spurious_format_packets{0};
     std::atomic<uint64_t> reconnect_attempts{0};
 
     // Idle/active state tracking for stats and verbose logging.
@@ -643,16 +641,11 @@ static FormatID pcm_id(unsigned char bits) {
 }
 
 // Build a DSD FormatConfigure. Scream signals DSD via sample_size == 1.
-// The Scream driver transmits HALF the DSD_U32 container rate (e.g. 44100 on
-// the wire -> DSD64). The screamalsa receiver restores the full container rate
-// with `rate *= 2`; s2d's network.c does NOT, so rf.sample_rate here is still
-// the halved wire value and we double it locally.
-// We present DSD to the Diretta SDK as 1-bit DSD in a 32-bit container.
-// Returned values are the *container* rate/bits/bpf used for queue sizing:
-//   container_rate = rf.sample_rate * 2   (e.g. 44100 -> 88200 for DSD64)
-//   dsd_real_rate  = container_rate * 32  ( == rf.sample_rate * 64 )
-//   bits = 32
-//   bpf  = channels * 4
+// The driver transmits HALF the DSD_U32 container rate and s2d's network.c
+// (unlike the screamalsa receiver) does NOT apply `rate *= 2`, so rf.sample_rate
+// here is the halved wire value; we restore the full rate locally:
+//   container_rate = rf.sample_rate * 2    (queue sizing; 44100 -> 88200 = DSD64)
+//   dsd_real_rate  = container_rate * 32   (SDK setSpeed; == rf.sample_rate * 64)
 static bool build_dsd_format(const receiver_format_t& rf, FormatConfigure& out_fc,
                              uint32_t* out_container_rate, uint32_t* out_channels,
                              uint32_t* out_bits, uint32_t* out_bpf,
@@ -663,10 +656,7 @@ static bool build_dsd_format(const receiver_format_t& rf, FormatConfigure& out_f
     map_rate(rf.sample_rate, &base, &mult);
     if (base != 44100u && base != 48000u) return false;
     if (mult == 0) mult = 1;
-    // Full DSD_U32 container rate (ALSA "samples" per second in 32-bit words),
-    // restored from the halved wire rate the same way the receiver does.
     const uint32_t container_rate = rf.sample_rate * 2u;
-    // Real DSD bit rate = container_rate * 32 = rf.sample_rate * 64.
     const uint32_t dsd_real_rate = container_rate * 32u;
     const uint32_t bpf = rf.channels * 4u;
     FormatID ch = channel_id(rf.channels);
@@ -692,10 +682,9 @@ static bool build_dsd_format(const receiver_format_t& rf, FormatConfigure& out_f
 }
 
 // Format-dependent flags derived from a Scream header. build_format() fills
-// this purely from its input; it does NOT touch g_st. Only the single
-// committer (reconfigure()) copies an accepted DerivedFormat into g_st, so the
-// validity probe in diretta_output_send() can build a candidate format without
-// corrupting the live DSD / pack-24 state or the transition log.
+// this purely from its input and never touches g_st; only reconfigure()
+// commits an accepted DerivedFormat, so the validity probe in
+// diretta_output_send() cannot corrupt live DSD / pack-24 state.
 struct DerivedFormat {
     bool     is_dsd = false;
     uint32_t dsd_multiplier = 0;
@@ -742,24 +731,6 @@ static bool build_format(const receiver_format_t& rf, FormatConfigure& out_fc,
     out_df->pcm_needs_pack_24 = (rf.sample_size == 24 &&
                                  rf.wire_layout == SCREAM_WIRE_S24_LE);
     return true;
-}
-
-// Build a FormatConfigure for a specific bit depth (used during format
-// negotiation fallback).  rate_hz is the decoded sample rate.
-static bool build_format_with_bits(uint32_t rate_hz, uint32_t channels, uint32_t bits,
-                                   FormatConfigure& out_fc) {
-    uint32_t base = 0, mult = 0;
-    map_rate(rate_hz, &base, &mult);
-    FormatID rb = rate_base_id(base);
-    FormatID rm = rate_mult_id(mult);
-    FormatID ch = channel_id(channels);
-    FormatID pc = pcm_id_for_bits(bits);
-    if (rb == FormatID::NONE || rm == FormatID::NONE ||
-        ch == FormatID::NONE || pc == FormatID::NONE) {
-        return false;
-    }
-    out_fc = FormatConfigure(ch | pc | rb | rm);
-    return out_fc.isValid();
 }
 
 // Confirm the sink accepts the source format as-is.
@@ -2317,11 +2288,10 @@ static bool reconfigure(const receiver_format_t& rf) {
              rf.sample_rate, rf.sample_size, rf.channels);
         return false;
     }
-    // Commit the derived format flags now that the format is accepted. These
-    // were previously written by build_format() as a side effect; doing it
-    // here keeps the validity probe in diretta_output_send() side-effect-free.
-    // The DSD sink-order flags are (re)negotiated in open_sync_worker_blocking,
-    // so reset them to a known default on every accepted format.
+    // Commit the derived format flags now that the format is accepted.
+    // reconfigure() is the sole committer so the validity probe in
+    // diretta_output_send() stays side-effect-free. DSD sink-order flags are
+    // (re)negotiated in open_sync_worker_blocking(), so reset to default here.
     g_st.is_dsd = df.is_dsd;
     g_st.dsd_multiplier = df.dsd_multiplier;
     g_st.dsd_real_rate = df.dsd_real_rate;
@@ -2942,8 +2912,8 @@ extern "C" void diretta_config_init(diretta_config_t *cfg) {
     cfg->dump_ingress_prefix = nullptr;
     cfg->dump_egress_prefix  = nullptr;
     cfg->dump_ms = 0;
-    // Raw-entry tap + ingress-tap byte comparator. Both default
-    // to disabled by default. The raw-entry
+    // Raw-entry tap + ingress-tap byte comparator. Both default to
+    // disabled. The raw-entry
     // tap captures data->audio raw (the exact bytes `-o stdout` would
     // write) at the entry of diretta_output_send so the user can prove
     // whether the click is present in the wire bytes or introduced by
@@ -3557,7 +3527,6 @@ extern "C" int diretta_output_send(receiver_data_t *data) {
         if (!validate_format(rf, probe_fc, &r, &c, &b, &bpf_probe, &probe_df)) {
             // Spurious / sentinel packet on stop/resume. Drop without
             // touching the SDK.
-            g_st.spurious_format_packets.fetch_add(1, std::memory_order_relaxed);
             DLOG(2, "ignoring spurious format packet: rate=%u Hz size=%u ch=%u",
                  rf.sample_rate, rf.sample_size, rf.channels);
             maybe_print_periodic_stats();

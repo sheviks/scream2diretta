@@ -13,7 +13,7 @@
 
 ```text
 Scream 发送端 (Windows / Linux / macOS)
-    │  UDP 单播/组播  端口 4011
+    │  UDP 单播/组播  端口 4010
     ▼
 ┌──────────────────────────────────────────────────────┐
 │  scream2diretta (Linux 主机)                         │
@@ -214,11 +214,11 @@ sudo ./scream2diretta --list-targets
 # 使用第一个目标设备运行（默认组播 239.255.77.77:4010）
 sudo ./scream2diretta
 
-# 绑定目标 #1，单播端口 4011，每 5 秒显示详细统计
-sudo ./scream2diretta -t 1 -p 4011 -vv --stats --stats-interval 5
+# 绑定目标 #1，单播端口 4010，每 5 秒显示详细统计
+sudo ./scream2diretta -t 1 -p 4010 -vv --stats --stats-interval 5
 
 # 使用 CPU 亲和性（推荐用于最佳音质）
-sudo ./scream2diretta -t 1 -p 4011 \
+sudo ./scream2diretta -t 1 -p 4010 \
   --cpu-scream 2 --cpu-audio 3 --cpu-other 1 \
   --thread-mode 1 --transfer-mode auto
 ```

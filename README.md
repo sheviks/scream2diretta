@@ -13,7 +13,7 @@ Receives a continuous uncompressed PCM stream from a remote machine running ASIO
 
 ```text
 Scream sender (Windows / Linux / macOS)
-    │  UDP unicast/multicast  port 4011
+    │  UDP unicast/multicast  port 4010
     ▼
 ┌──────────────────────────────────────────────────────┐
 │  scream2diretta (Linux host)                         │
@@ -214,11 +214,11 @@ sudo ./scream2diretta --list-targets
 # Run with the first target (default multicast 239.255.77.77:4010)
 sudo ./scream2diretta
 
-# Pin to target #1, unicast port 4011, verbose stats every 5s
-sudo ./scream2diretta -t 1 -p 4011 -vv --stats --stats-interval 5
+# Pin to target #1, unicast port 4010, verbose stats every 5s
+sudo ./scream2diretta -t 1 -p 4010 -vv --stats --stats-interval 5
 
 # With CPU affinity (recommended for best sound quality)
-sudo ./scream2diretta -t 1 -p 4011 \
+sudo ./scream2diretta -t 1 -p 4010 \
   --cpu-scream 2 --cpu-audio 3 --cpu-other 1 \
   --thread-mode 1 --transfer-mode auto
 ```

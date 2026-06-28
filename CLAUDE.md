@@ -16,7 +16,7 @@ no decode stage. All decoding happens upstream.
 
 ```
 Scream sender (Windows / Linux)
-    │  UDP unicast/multicast  port 4011
+    │  UDP unicast/multicast  port 4010
     ▼
 ┌─────────────────────────────────────┐
 │  scream2diretta                     │

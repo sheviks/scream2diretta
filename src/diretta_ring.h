@@ -186,8 +186,9 @@ public:
     // Discard up to `len` of the OLDEST queued bytes by advancing the read
     // pointer. Caller must ensure `len` is whole-frame aligned. Returns the
     // number of bytes actually discarded (clamped to currently available).
-    // Used by the queue drain diagnostics to bound startup latency on a fresh
-    // Sync open by dropping pre-open backlog instead of replaying it all.
+    // Used by the startup queue cap (--startup-max-queue-ms) to bound startup
+    // latency on a fresh Sync open by dropping pre-open backlog instead of
+    // replaying it all.
     size_t discardOldest(size_t len) {
         if (m_size == 0 || len == 0) return 0;
         size_t avail = available();

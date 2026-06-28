@@ -303,9 +303,6 @@ void receiver_tap_init(const char* payload_prefix,
 #endif // SCREAM2DIRETTA_NO_DIAGNOSTICS
 }
 
-int receiver_tap_payload_enabled(void) { return g_rt.payload_enabled ? 1 : 0; }
-int receiver_tap_raw_enabled(void)     { return g_rt.raw_enabled ? 1 : 0; }
-
 void receiver_tap_payload_feed(const void* data, size_t bytes,
                                uint32_t rate_hz, uint32_t bits, uint32_t chans) {
     if (__builtin_expect(!g_receiver_tap_any_armed_flag, 1)) return;

@@ -10,7 +10,6 @@
 #include <Diretta/Sync>
 #include <Diretta/Stream>
 
-#include <algorithm>
 #include <cstring>
 #include <iostream>
 #include <thread>

@@ -96,14 +96,6 @@ int pcm_dumper_enabled(const pcm_dumper_t* d) {
     return (d && d->enabled) ? 1 : 0;
 }
 
-int pcm_dumper_is_writing(const pcm_dumper_t* d) {
-    return (d && d->enabled && d->fp != nullptr && !d->closed_by_cap) ? 1 : 0;
-}
-
-int pcm_dumper_cap_reached(const pcm_dumper_t* d) {
-    return (d && d->closed_by_cap) ? 1 : 0;
-}
-
 int pcm_dumper_open_or_rotate(pcm_dumper_t* d,
                               uint32_t sample_rate,
                               uint32_t channels,

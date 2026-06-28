@@ -95,10 +95,6 @@ void receiver_tap_diretta_raw_entry_feed(const void* data, size_t bytes,
 // when nothing was enabled.
 void receiver_tap_shutdown(void);
 
-// Returns 1 iff the receiver-payload tap is armed (CLI prefix non-empty).
-int  receiver_tap_payload_enabled(void);
-int  receiver_tap_raw_enabled(void);
-
 // Single-point fast-path gate. Computed once in receiver_tap_init() as
 // (payload_dump || raw_dump || analyze_ms>0 || (compare_ms>0 && backend>0)).
 // Exposed as a plain int so call sites in C and C++ can early-out before

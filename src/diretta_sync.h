@@ -118,14 +118,6 @@ public:
     void attachEgressAnalyzer(pcm_startup_analyzer_t* a) { m_egress_analyzer = a; }
     void attachEgressFader(pcm_startup_fader_t* f)       { m_egress_fader = f; }
 
-    //  format scalars cached for the egress dumper open. Set alongside
-    // configureFormat() and read by the SDK send thread; populated from
-    // the same arguments passed to configureFormat so the dumper never
-    // disagrees with the active PCM format.
-    uint32_t egressSampleRate()   const { return m_egress_rate; }
-    uint32_t egressChannels()     const { return m_egress_channels; }
-    uint32_t egressBitsPerSample() const { return m_egress_bits; }
-
     // Set up per-format state (bytes_per_frame, prefill threshold, cycle
     // size). The ring must already have been sized by the caller and
     // attached via attachRing(). Called from the control thread on Sync
@@ -140,11 +132,8 @@ public:
     void resetGate();
 
     // Stats accessors. Safe to read from any thread (atomic loads).
-    uint64_t underruns()    const { return m_ring ? m_ring->underrunCount() : 0; }
     uint64_t pushedBytes()  const { return m_ring ? m_ring->pushedBytes() : 0; }
-    uint64_t pushedFrames() const { return m_ring ? m_ring->pushedFrames() : 0; }
     uint64_t dropBytes()    const { return m_ring ? m_ring->dropBytes() : 0; }
-    uint64_t dropFrames()   const { return m_ring ? m_ring->dropFrames() : 0; }
     size_t   ringBytes()    const { return m_ring ? m_ring->capacity() : 0; }
     size_t   ringFill()     const { return m_ring ? m_ring->available() : 0; }
     uint64_t getStreamCount() const { return m_streamCount.load(std::memory_order_acquire); }
@@ -154,8 +143,6 @@ public:
     bool     rebuffering()    const { return m_rebuffering.load(std::memory_order_acquire); }
     size_t   prefillBytes()   const { return m_prefillBytes.load(std::memory_order_acquire); }
     bool     muteDone()       const { return m_muteDone.load(std::memory_order_acquire); }
-    size_t   muteBytes()      const { return m_muteBytes.load(std::memory_order_acquire); }
-    size_t   muteBytesEmitted() const { return m_muteBytesEmitted.load(std::memory_order_acquire); }
     //  bytes consumed (popped) from the ring. Used by stats interval
     // logging to derive drain rate without snooping ring internals.
     uint64_t poppedBytes()   const { return m_poppedBytes.load(std::memory_order_acquire); }
@@ -165,15 +152,6 @@ public:
     // currently armed for the rebuffering hold.
     uint64_t underrunEvents()      const { return m_underrunEvents.load(std::memory_order_acquire); }
     size_t   rebufferTargetBytes() const { return m_rebufferTargetBytes.load(std::memory_order_acquire); }
-    size_t   underrunRebufferBytes() const { return m_underrunRebufferBytes.load(std::memory_order_acquire); }
-
-    // Convert dropped frames to milliseconds using the active format.
-    uint64_t dropMs() const {
-        uint32_t bps = m_bytesPerSecond.load(std::memory_order_acquire);
-        if (bps == 0 || !m_ring) return 0;
-        uint64_t bytes = m_ring->dropBytes();
-        return (bytes * 1000ULL) / bps;
-    }
 
     // Current ring fill in milliseconds, or 0 if format not yet known.
     uint64_t ringFillMs() const {
@@ -209,7 +187,7 @@ protected:
 private:
     // Externally owned. Owner (DirettaState) guarantees the pointer remains
     // valid for the Sync's lifetime — it is sized once per format-change
-    // and not freed until the Sync is gone (and any abandoned ones too).
+    // and not freed until the Sync is gone.
     PcmRing* m_ring = nullptr;
 
     // Lifecycle gate. Set to false by deactivate() before the owner tears

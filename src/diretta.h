@@ -34,7 +34,7 @@ extern "C" {
  * Behaviour:
  *   - Opens the Diretta Host SDK once, runs Find to discover sinks.
  *   - Target selection is by index (1-based) into the Find::findOutput() list.
- *   - On format changes, tears down the SyncBuffer asynchronously without
+ *   - On format changes, tears down the ScreamDirettaSync asynchronously without
  *     blocking the audio thread, creates a fresh unified queue for the new
  *     format, and reopens with the mapped FormatID. PCM during cooldown
  *     flows into the new queue immediately so the head of the track is
@@ -97,14 +97,14 @@ typedef struct diretta_config_s {
      * underrun recovery hold, so a single transient hiccup recovers after
      * accumulating ~underrun_rebuffer_ms of audio instead of refilling to
      * 50% of the ring (~500 ms at default ring_buffer_ms=1000). 0 (default
-     * default behaviour) falls back to rebuffer_percent. Range 0..5000. */
+     * behaviour) falls back to rebuffer_percent. Range 0..5000. */
     int underrun_rebuffer_ms;
     int startup_queue_ms;
     /*  minimum number of getNewStream cycles, expressed in ms of audio,
      * during which the Sync MUST output zero PCM after a fresh open. Acts as
      * a forced silent warmup that runs through real Diretta pull cycles --
      * letting the target / DAC settle on silence before any real PCM lands.
-     * 0 disables it (= default behaviour). Default 100ms. Range 0..2000.
+     * 0 disables it (= default behaviour and the default). Range 0..2000.
      *
      *  optional hard cap on the unified queue fill (ms) while the
      * startup mute is still active. 0 = no cap (= default behaviour and the
@@ -331,10 +331,14 @@ int diretta_output_send(receiver_data_t *data);
 
 /* Heartbeat tick called by the receiver loop when no PCM packet was
  * received this iteration (upstream silent / select() timeout). Runs the
- * upstream-idle-release check: when the active Sync has been streaming and
- * no real PCM has arrived for cfg.upstream_idle_timeout_sec, the Sync is
- * torn down and the reconnect path is armed so playback resumes on the
- * next packet. No-op when idle release is disabled or no Sync is open. */
+ * upstream-idle escalation in two stages:
+ *   Stage 1 (pause): after cfg.upstream_pause_timeout_sec of idle, stop the
+ *     SDK send thread but keep the connection, so the Target stops being
+ *     driven; resumes on the next real PCM.
+ *   Stage 2 (release): after the longer cfg.upstream_idle_timeout_sec, tear
+ *     the Sync down completely (stop + disconnect) and arm the reconnect
+ *     path so playback resumes on the next packet.
+ * No-op when both idle features are disabled or no Sync is open. */
 void diretta_output_tick(void);
 
 void diretta_output_shutdown(void);
