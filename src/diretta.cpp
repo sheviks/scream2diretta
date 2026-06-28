@@ -90,11 +90,17 @@ struct DirettaState {
     bool queue_ready = false;
     uint32_t queue_bpf = 0;
 
-    // Last *effective* PCM format we accepted. Only the fields that drive
+    // Last *effective* PCM format we accepted. The fields that drive
     // Diretta config are compared (sample_rate, sample_size, channels).
+    // wire_layout is also compared because for 24-bit PCM it selects between
+    // S24_3LE (src_bpf = 3*ch, no pack) and S24_LE (src_bpf = 4*ch, pack to
+    // 3-byte). A 3LE<->4LE switch at the same rate/size/channels would
+    // otherwise leave src_bytes_per_frame / pcm_needs_pack_24 stale and
+    // misalign every frame.
     uint32_t last_sample_rate = 0;
     uint8_t last_sample_size = 0;
     uint8_t last_channels = 0;
+    uint8_t last_wire_layout = 0;
     bool have_last_fmt = false;
 
     bool sink_active = false;
@@ -637,23 +643,31 @@ static FormatID pcm_id(unsigned char bits) {
 }
 
 // Build a DSD FormatConfigure. Scream signals DSD via sample_size == 1.
-// The container sample_rate is half the real DSD bit rate (e.g. 44100 -> DSD64).
+// The Scream driver transmits HALF the DSD_U32 container rate (e.g. 44100 on
+// the wire -> DSD64). The screamalsa receiver restores the full container rate
+// with `rate *= 2`; s2d's network.c does NOT, so rf.sample_rate here is still
+// the halved wire value and we double it locally.
 // We present DSD to the Diretta SDK as 1-bit DSD in a 32-bit container.
 // Returned values are the *container* rate/bits/bpf used for queue sizing:
-//   container_rate = dsd_real_rate / 32
+//   container_rate = rf.sample_rate * 2   (e.g. 44100 -> 88200 for DSD64)
+//   dsd_real_rate  = container_rate * 32  ( == rf.sample_rate * 64 )
 //   bits = 32
 //   bpf  = channels * 4
 static bool build_dsd_format(const receiver_format_t& rf, FormatConfigure& out_fc,
                              uint32_t* out_container_rate, uint32_t* out_channels,
                              uint32_t* out_bits, uint32_t* out_bpf,
                              uint32_t* out_dsd_multiplier, uint32_t* out_dsd_real_rate) {
-    // rf.sample_rate is the ALSA DSD_U32_BE container rate (half the real DSD bit rate).
+    // map_rate runs on the halved wire value: base must be 44100/48000 and the
+    // multiplier (DSD64=1, DSD128=2, ...) is derived from it directly.
     uint32_t base = 0, mult = 0;
     map_rate(rf.sample_rate, &base, &mult);
     if (base != 44100u && base != 48000u) return false;
     if (mult == 0) mult = 1;
-    const uint32_t dsd_real_rate = rf.sample_rate * 64u;
-    const uint32_t container_rate = rf.sample_rate;  // ALSA "samples" per second in 32-bit words
+    // Full DSD_U32 container rate (ALSA "samples" per second in 32-bit words),
+    // restored from the halved wire rate the same way the receiver does.
+    const uint32_t container_rate = rf.sample_rate * 2u;
+    // Real DSD bit rate = container_rate * 32 = rf.sample_rate * 64.
+    const uint32_t dsd_real_rate = container_rate * 32u;
     const uint32_t bpf = rf.channels * 4u;
     FormatID ch = channel_id(rf.channels);
     if (ch == FormatID::NONE) return false;
@@ -677,22 +691,32 @@ static bool build_dsd_format(const receiver_format_t& rf, FormatConfigure& out_f
     return true;
 }
 
+// Format-dependent flags derived from a Scream header. build_format() fills
+// this purely from its input; it does NOT touch g_st. Only the single
+// committer (reconfigure()) copies an accepted DerivedFormat into g_st, so the
+// validity probe in diretta_output_send() can build a candidate format without
+// corrupting the live DSD / pack-24 state or the transition log.
+struct DerivedFormat {
+    bool     is_dsd = false;
+    uint32_t dsd_multiplier = 0;
+    uint32_t dsd_real_rate = 0;
+    bool     pcm_needs_pack_24 = false;
+};
+
 static bool build_format(const receiver_format_t& rf, FormatConfigure& out_fc,
                          uint32_t* out_rate, uint32_t* out_channels,
-                         uint32_t* out_bits, uint32_t* out_bpf) {
-    g_st.pcm_needs_pack_24 = false;
+                         uint32_t* out_bits, uint32_t* out_bpf,
+                         DerivedFormat* out_df) {
+    *out_df = DerivedFormat{};
     // DSD sentinel: screamalsa sets sample_size == 1 for DSD_U32_BE.
     if (rf.sample_size == 1) {
         uint32_t dsd_mult = 0, dsd_real = 0;
         bool ok = build_dsd_format(rf, out_fc, out_rate, out_channels, out_bits, out_bpf,
                                    &dsd_mult, &dsd_real);
         if (ok) {
-            g_st.is_dsd = true;
-            g_st.dsd_multiplier = dsd_mult;
-            g_st.dsd_real_rate = dsd_real;
-            // Flags will be set during open_sync_worker_blocking DSD negotiation.
-            g_st.dsd_needs_bit_reverse = false;
-            g_st.dsd_needs_byte_swap = false;
+            out_df->is_dsd = true;
+            out_df->dsd_multiplier = dsd_mult;
+            out_df->dsd_real_rate = dsd_real;
         }
         return ok;
     }
@@ -715,13 +739,8 @@ static bool build_format(const receiver_format_t& rf, FormatConfigure& out_fc,
     // build_format returns the SOURCE bytes per frame; reconfigure() derives the
     // queue bytes per frame (Diretta SDK always wants packed 3-byte S24).
     *out_bpf = scream_bytes_per_sample(&rf) * rf.channels;
-    g_st.is_dsd = false;
-    g_st.dsd_multiplier = 0;
-    g_st.dsd_real_rate = 0;
-    g_st.dsd_needs_bit_reverse = false;
-    g_st.dsd_needs_byte_swap = false;
-    g_st.pcm_needs_pack_24 = (rf.sample_size == 24 &&
-                              rf.wire_layout == SCREAM_WIRE_S24_LE);
+    out_df->pcm_needs_pack_24 = (rf.sample_size == 24 &&
+                                 rf.wire_layout == SCREAM_WIRE_S24_LE);
     return true;
 }
 
@@ -2275,11 +2294,12 @@ static bool teardown_sync_for_runtime(const char* reason) {
 
 static bool validate_format(const receiver_format_t& rf, FormatConfigure& out_fc,
                             uint32_t* out_rate, uint32_t* out_channels,
-                            uint32_t* out_bits, uint32_t* out_bpf) {
+                            uint32_t* out_bits, uint32_t* out_bpf,
+                            DerivedFormat* out_df) {
     if (rf.channels == 0) return false;
     // DSD sentinel (sample_size == 1) is valid; normal PCM needs sample_size > 0.
     if (rf.sample_size == 0) return false;
-    if (!build_format(rf, out_fc, out_rate, out_channels, out_bits, out_bpf)) return false;
+    if (!build_format(rf, out_fc, out_rate, out_channels, out_bits, out_bpf, out_df)) return false;
     if (*out_bpf == 0 || *out_bpf > PARTIAL_FRAME_MAX) return false;
     return true;
 }
@@ -2291,11 +2311,24 @@ static bool validate_format(const receiver_format_t& rf, FormatConfigure& out_fc
 static bool reconfigure(const receiver_format_t& rf) {
     FormatConfigure fc;
     uint32_t rate = 0, ch = 0, bits = 0, bpf = 0;
-    if (!validate_format(rf, fc, &rate, &ch, &bits, &bpf)) {
+    DerivedFormat df;
+    if (!validate_format(rf, fc, &rate, &ch, &bits, &bpf, &df)) {
         DLOG(0, "unsupported scream format: rate=%u Hz size=%u ch=%u",
              rf.sample_rate, rf.sample_size, rf.channels);
         return false;
     }
+    // Commit the derived format flags now that the format is accepted. These
+    // were previously written by build_format() as a side effect; doing it
+    // here keeps the validity probe in diretta_output_send() side-effect-free.
+    // The DSD sink-order flags are (re)negotiated in open_sync_worker_blocking,
+    // so reset them to a known default on every accepted format.
+    g_st.is_dsd = df.is_dsd;
+    g_st.dsd_multiplier = df.dsd_multiplier;
+    g_st.dsd_real_rate = df.dsd_real_rate;
+    g_st.pcm_needs_pack_24 = df.pcm_needs_pack_24;
+    g_st.dsd_needs_bit_reverse = false;
+    g_st.dsd_needs_byte_swap = false;
+
     // SOURCE bytes per frame from the Scream header (e.g. 8 for stereo S24_LE).
     const uint32_t src_bpf = bpf;
     // DESTINATION bytes per frame for the queue / SDK. Diretta SDK only has
@@ -2377,8 +2410,8 @@ static bool reconfigure(const receiver_format_t& rf) {
     g_st.next_reconnect_at = g_st.reconfigure_ready_at;
     g_st.conn_lost_logged = false;
 
-    // DSD state is tracked from the format builder; for PCM it was
-    // already cleared by build_format().  Set silence byte accordingly.
+    // DSD state was committed from the DerivedFormat at the top of
+    // reconfigure(); for PCM g_st.is_dsd is false. Set silence byte accordingly.
     const bool is_dsd = g_st.is_dsd;
     const uint8_t silence_byte = is_dsd ? DSD_SILENCE_BYTE : 0x00;
 
@@ -3503,16 +3536,25 @@ extern "C" int diretta_output_send(receiver_data_t *data) {
 
     const receiver_format_t& rf = data->format;
 
+    // wire_layout only distinguishes a real format for 24-bit PCM
+    // (S24_3LE vs S24_LE). For all other sample sizes the receiver sets it
+    // to 0 and it must be ignored, so only fold it into the comparison when
+    // sample_size == 24.
+    const bool wire_layout_differs =
+        (rf.sample_size == 24) && (rf.wire_layout != g_st.last_wire_layout);
+
     const bool effective_fmt_changed =
         !g_st.have_last_fmt ||
         rf.sample_rate != g_st.last_sample_rate ||
         rf.sample_size != g_st.last_sample_size ||
-        rf.channels    != g_st.last_channels;
+        rf.channels    != g_st.last_channels ||
+        wire_layout_differs;
 
     if (effective_fmt_changed) {
         FormatConfigure probe_fc;
         uint32_t r=0, c=0, b=0, bpf_probe=0;
-        if (!validate_format(rf, probe_fc, &r, &c, &b, &bpf_probe)) {
+        DerivedFormat probe_df;  // discarded; reconfigure() recomputes + commits
+        if (!validate_format(rf, probe_fc, &r, &c, &b, &bpf_probe, &probe_df)) {
             // Spurious / sentinel packet on stop/resume. Drop without
             // touching the SDK.
             g_st.spurious_format_packets.fetch_add(1, std::memory_order_relaxed);
@@ -3550,6 +3592,10 @@ extern "C" int diretta_output_send(receiver_data_t *data) {
         g_st.last_sample_rate = rf.sample_rate;
         g_st.last_sample_size = rf.sample_size;
         g_st.last_channels = rf.channels;
+        // Store wire_layout normalised: it only carries meaning for 24-bit
+        // PCM, so for any other sample size we record 0 to match how the
+        // receiver fills it and keep the next comparison stable.
+        g_st.last_wire_layout = (rf.sample_size == 24) ? rf.wire_layout : 0;
         g_st.have_last_fmt = true;
         if (!reconfigure(rf)) {
             g_st.partial_frame_len = 0;
