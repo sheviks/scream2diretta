@@ -10,6 +10,55 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.6.0] - 2026-06-28
+
+### Summary
+
+Ports the extended ScreamALSA receiver protocol to s2d so it can receive PCM
+16/24/32-bit (including S24_LE and packed S24_3LE) and DSD up to DSD512 from
+the current ScreamALSA driver, while keeping the original 5-byte legacy header
+available via `-L` for ap2renderer / ASIOScream / old scream-alsa.
+
+### Added
+
+- **Extended 6-byte ScreamALSA header support**. `sample_rate` is decoded from
+the new byte[0] + byte[4] rate encoding, the `wire_layout` byte (byte[5])
+exposes `S24_3LE` vs `S24_LE`, and `scream_bytes_per_sample()` returns the
+correct on-wire size for each format. (`scream.h`, `network.c`, all output
+backends)
+
+- **S24_LE → S24_3LE packing on ingress**. Diretta SDK only exposes packed
+`FMT_PCM_SIGNED_24`. When the sender signals `wire_layout = 1` (4-byte
+container), s2d strips the padding byte before the data enters `PcmRing`. The
+conversion is lossless, runs on the receiver thread, and keeps the SDK path
+bit-perfect. (`diretta.cpp`, `diretta_ring.h`)
+
+- **`--legacy` / `-L` switch** to receive the original 5-byte Scream header.
+Legacy rate decoding and legacy DSD byte-interleave reversal are handled in
+`network.c`; the Diretta backend then sees standard ALSA `DSD_U32_BE`
+word-interleaved data. (`scream.c`, `network.c`, `network.h`, `pcap_input.c`)
+
+- **DSD support across all receiver outputs** (`alsa`, `raw`, `pulseaudio`,
+`jack`, `sndio`, `pcap`, `shmem`). Each backend now uses the decoded Hz
+`sample_rate` and handles `sample_size == 1` as DSD where applicable.
+(`alsa.c`, `raw.c`, `pulseaudio.c`, `jack.c`, `sndio.c`, `pcap_input.c`,
+`shmem.c`)
+
+### Changed
+
+- **README version bump to 0.6** and documented the extended/legacy header
+formats, the S24_LE packing behaviour, and the new `-L` flag.
+
+### Fixed
+
+- **Removed unconditional DSD deinterleave from `diretta.cpp`**. New
+ScreamALSA already sends standard word-interleaved `DSD_U32_BE`; legacy
+byte-interleaved input is converted by `network.c` before it reaches the
+backend. `diretta.cpp` now applies only the target-negotiated bit-reversal /
+byte-swap transforms, fixing DSD playback with current ScreamALSA. (`diretta.cpp`)
+
+---
+
 ## [0.5.0] - 2026-06-22
 
 ### Summary

@@ -1,6 +1,6 @@
 # scream2diretta
 
-**v0.3** · A native **Scream UDP → Diretta SDK** bridge for Linux (aarch64, x86-64).
+**v0.6** · A native **Scream UDP → Diretta SDK** bridge for Linux (aarch64, x86-64).
 
 Receives a continuous uncompressed PCM stream from a remote machine running ASIOScream / ScreamDriver / scream-alsa over UDP, and forwards it directly to a Diretta-capable DAC via the Diretta Host SDK — **without ALSA, FFmpeg, UPnP, or any intermediate software layer**.
 
@@ -227,6 +227,7 @@ sudo ./scream2diretta -t 1 -p 4011 \
 
 | Flag | Default | Description |
 |------|---------|-------------|
+| `-L` | off | Use original 5-byte Scream header (legacy mode). Required for ap2renderer and the original scream-alsa driver, which send byte-interleaved DSD and the legacy rate encoding. |
 | `--target, -t <index>` | 1 | Select Diretta target by 1-based index |
 | `--list-targets` | — | Discover and list targets |
 | `-p <port>` | 4010 | UDP port for Scream |
@@ -333,18 +334,49 @@ re-negotiation.
 
 ## Scream Protocol
 
-Scream sends raw uncompressed PCM over UDP:
+Scream sends raw uncompressed PCM or DSD over UDP. s2d understands both the **extended 6-byte ScreamALSA header** (default) and the **original 5-byte Scream header** (`-L` legacy mode).
+
+### Extended header (default)
+
+Used by the current ScreamALSA driver. Supports PCM 16/24/32-bit and DSD up to DSD512.
 
 ```
-Byte 0: sample rate code
-Byte 1: bit depth (16 / 24 / 32)
-Byte 2: channels
-Byte 3: channel map
-Byte 4+: interleaved PCM samples (little-endian signed)
+Byte 0:       sample rate multiplier (low 8 bits)
+Byte 1:       sample size (16 / 24 / 32, or 1 for DSD)
+Byte 2:       channels
+Byte 3:       channel map
+Byte 4:       bits 3:0 = rate multiplier high bits
+              bit 4    = 0 -> 48k family, 1 -> 44.1k family
+              bit 7    = end-of-track flag
+Byte 5:       wire_layout (0 = packed S24_3LE, 1 = S24_LE 4-byte container)
+Byte 6+:      interleaved samples
 ```
+
+For 24-bit PCM the `wire_layout` byte distinguishes:
+- `0` — packed 3-byte little-endian (`S24_3LE`). This is what Diretta SDK
+  natively consumes as `FMT_PCM_SIGNED_24`.
+- `1` — 24-bit samples in 32-bit little-endian containers (`S24_LE`). s2d
+  drops the padding byte on ingress so the queued data is still packed S24_3LE.
+  The conversion is lossless and runs on the receiver thread.
+
+### Legacy header (`-L`)
+
+Used by the original Scream driver, ap2renderer, and ASIOScream.
+
+```
+Byte 0: sample rate code (>=128 -> 44100*(code-128), else 48000*code)
+Byte 1: bit depth (16 / 24 / 32, or 1 for DSD)
+Byte 2: channels
+Byte 3: channel map low byte
+Byte 4: channel map high byte
+Byte 5+: interleaved samples
+```
+
+Legacy DSD is sent byte-interleaved; s2d deinterleaves it to standard ALSA
+`DSD_U32_BE` word order before passing it to the Diretta SDK.
 
 - No sequence numbers, no retransmit — pure UDP.
-- Format changes are detected by changes in bytes 0-3.
+- Format changes are detected by changes in the header bytes.
 - Continuous stream, no track boundaries.
 
 ---
