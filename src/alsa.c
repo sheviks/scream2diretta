@@ -93,6 +93,7 @@ int alsa_output_init(int latency, char *alsa_device)
   ao_data.receiver_format.sample_size = 0;
   ao_data.receiver_format.channels = 2;
   ao_data.receiver_format.channel_map = 0x0003;
+  ao_data.receiver_format.wire_layout = 0;
 
   ao_data.latency = latency;
   ao_data.alsa_device = alsa_device;
@@ -120,11 +121,35 @@ int alsa_output_send(receiver_data_t *data)
     // audio format changed, reconfigure
     memcpy(&ao_data.receiver_format, rf, sizeof(receiver_format_t));
 
-    ao_data.rate = ((rf->sample_rate >= 128) ? 44100 : 48000) * (rf->sample_rate % 128);
+    if (rf->channels != SCREAM_SUPPORTED_CHANNELS) {
+      fprintf(stderr, "ScreamALSA receiver: only %d channels supported (got %u)\n",
+              SCREAM_SUPPORTED_CHANNELS, rf->channels);
+      ao_data.rate = 0;
+      close_alsa(ao_data.snd);
+      ao_data.snd = NULL;
+      return 0;
+    }
+
+    /* sample_rate field now holds the fully decoded header rate value */
+    ao_data.rate = rf->sample_rate;
     switch (rf->sample_size) {
       case 16: format = SND_PCM_FORMAT_S16_LE; ao_data.bytes_per_sample = 2; break;
-      case 24: format = SND_PCM_FORMAT_S24_3LE; ao_data.bytes_per_sample = 3; break;
+      case 24:
+        if (rf->wire_layout == SCREAM_WIRE_S24_LE) {
+          format = SND_PCM_FORMAT_S24_LE;
+          ao_data.bytes_per_sample = 4;
+        } else {
+          format = SND_PCM_FORMAT_S24_3LE;
+          ao_data.bytes_per_sample = 3;
+        }
+        break;
       case 32: format = SND_PCM_FORMAT_S32_LE; ao_data.bytes_per_sample = 4; break;
+      case 1:
+        format = SND_PCM_FORMAT_DSD_U32_BE;
+        ao_data.bytes_per_sample = 4;
+        /* Driver encodes half the DSD sample rate; receiver restores full rate. */
+        ao_data.rate *= 2;
+        break;
       default:
         if (verbosity > 0)
           fprintf(stderr, "Unsupported sample size %hhu, not playing until next format switch.\n", rf->sample_size);
@@ -200,7 +225,11 @@ int alsa_output_send(receiver_data_t *data)
       }
       else {
         if (verbosity > 0)
-          fprintf(stderr, "Switched format to sample rate %u, sample size %hhu and %u channels.\n", ao_data.rate, rf->sample_size, rf->channels);
+          fprintf(stderr, "Switched format to sample rate %u, sample size %hhu (%s), %u channels.\n",
+                  ao_data.rate, rf->sample_size,
+                  (rf->sample_size == 1) ? "DSD_U32_BE" :
+                  (rf->sample_size == 24) ? (rf->wire_layout ? "S24_LE" : "S24_3LE") : "PCM",
+                  rf->channels);
       }
     }
 

@@ -102,6 +102,8 @@ static void show_usage(const char *arg0)
   fprintf(stderr, "  -g <group>                   Multicast group address (multicast mode only).\n");
   fprintf(stderr, "  -m <ivshmem device path>     Use shared memory device.\n");
   fprintf(stderr, "  -P                           Use libpcap to sniff the packets.\n");
+  fprintf(stderr, "  -L                           Legacy mode: parse original 5-byte Scream header\n");
+  fprintf(stderr, "                               (for original screamalsa driver / ap2renderer).\n");
   fprintf(stderr, "  --udp-rcvbuf-bytes <bytes>   Kernel SO_RCVBUF size on the UDP socket\n");
   fprintf(stderr, "                               (default 4194304 = 4 MiB for Diretta;\n");
   fprintf(stderr, "                               0 = leave kernel default).\n");
@@ -409,6 +411,7 @@ int main(int argc, char*argv[]) {
   uint16_t port              = DEFAULT_PORT;
   int jack_connect           = 1;
   int quiet                  = 0;
+  int legacy_mode            = 0;
   int do_list_targets        = 0;
   /* PCM dump tracking. Persisted across the option loop because we
    * may need to retroactively set the default --dump-ms once we know any
@@ -453,7 +456,7 @@ int main(int argc, char*argv[]) {
   int longindex = 0;
 
   while ((opt = getopt_long(argc, argv,
-                            "i:g:p:m:x:o:d:s:n:t:l:Puvqhc",
+                            "i:g:p:m:x:o:d:s:n:t:l:PuL vqhc",
                             long_options, &longindex)) != -1) {
     switch (opt) {
     case 'i':
@@ -471,6 +474,9 @@ int main(int argc, char*argv[]) {
       break;
     case 'P':
       receiver_mode = Pcap;
+      break;
+    case 'L':
+      legacy_mode = 1;
       break;
     case 'm':
       receiver_mode = SharedMem;
@@ -1296,7 +1302,8 @@ int main(int argc, char*argv[]) {
       if (verbosity) fprintf(stderr, "Starting %s receiver\n", receiver_mode == Unicast ? "unicast" : "multicast");
       if (init_network(receiver_mode, interface, port, multicast_group,
                          udp_rcvbuf_bytes, allowed_source_ip,
-                         udp_busy_poll_us, enable_nic_timestamp) != 0) {
+                         udp_busy_poll_us, enable_nic_timestamp,
+                         legacy_mode) != 0) {
         return 1;
       }
       receiver_rcv_fn = rcv_network;
@@ -1337,9 +1344,7 @@ int main(int argc, char*argv[]) {
      * with zero function-call overhead. */
     if (receiver_tap_any_armed()) {
       const receiver_format_t* rf = &receiver_data.format;
-      uint32_t base = (rf->sample_rate >= 128) ? 44100u : 48000u;
-      uint32_t mult = (uint32_t)(rf->sample_rate % 128u);
-      uint32_t rate_hz = base * mult;
+      uint32_t rate_hz = rf->sample_rate;
       uint32_t bits = (uint32_t)rf->sample_size;
       uint32_t chans = (uint32_t)rf->channels;
       receiver_tap_payload_feed(receiver_data.audio,

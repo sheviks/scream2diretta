@@ -80,17 +80,18 @@ void pcap_callback(u_char *args, const struct pcap_pkthdr *header, const u_char 
   }
 
   receiver_data_t receiver_data = {0};
-  if (size_payload < HEADER_SIZE) {
-    fprintf(stderr, "WARN: received packet shorter than %d\n", HEADER_SIZE);
+  if (size_payload < LEGACY_HEADER_SIZE) {
+    fprintf(stderr, "WARN: received packet shorter than %d\n", LEGACY_HEADER_SIZE);
     return;
   }
 
-  receiver_data.format.sample_rate = payload[0];
+  receiver_data.format.sample_rate = scream_decode_rate_legacy(payload[0]);
   receiver_data.format.sample_size = payload[1];
   receiver_data.format.channels = payload[2];
   receiver_data.format.channel_map = (payload[4] << 8u) | payload[3];
-  receiver_data.audio_size = size_payload - HEADER_SIZE;
-  receiver_data.audio = &payload[5];
+  receiver_data.format.wire_layout = 0;
+  receiver_data.audio_size = size_payload - LEGACY_HEADER_SIZE;
+  receiver_data.audio = &payload[LEGACY_HEADER_SIZE];
 
   int ret = pcap_output_callback(&receiver_data);
   if (ret != 0) {

@@ -6,15 +6,18 @@
 //
 // Differences vs. slim2Diretta's DirettaRingBuffer:
 //   * PCM only. Scream packets are already PCM with a small header, so we
-//     never need DSD bit-reversal, byte-swap, S24 packing, or 16→32 / 16→24
-//     upsampling. Those paths in slim2Diretta exist because LMS/SlimProto
-//     can deliver compressed audio (FLAC/MP3/AAC/Ogg) and DSD-over-PCM, none
-//     of which Scream produces.
+//     never need DSD bit-reversal, byte-swap, 16→32 / 16→24 upsampling, or
+//     similar codec outputs. Those paths in slim2Diretta exist because
+//     LMS/SlimProto can deliver compressed audio (FLAC/MP3/AAC/Ogg) and
+//     DSD-over-PCM, none of which Scream produces.
+//   * 24-bit repack is performed by the producer (diretta.cpp) before the
+//     bytes reach the ring: the ring only stores the format the SDK expects.
 //   * No SIMD shuffles. Steady-state path is a pair of memcpy()s.
 //   * No staging buffers. The slim2Diretta ring carries 192KB of staging
 //     buffers (24-bit pack / 16→32 / DSD); we don't need any of them.
 //   * No S24-pack auto-detection state machine. Scream tags 24-bit content
-//     explicitly via `sample_size` in the receiver_format_t header.
+//     explicitly via `sample_size` and `wire_layout` in the receiver_format_t
+//     header.
 //
 // Steady-state hot path: push() and pop() both do at most two memcpy()s
 // against a preallocated, frame-aligned buffer. No heap allocations.
