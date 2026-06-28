@@ -1,6 +1,6 @@
 # scream2diretta
 
-**v0.3** · 原生 **Scream UDP → Diretta SDK** 桥接器，适用于 Linux (aarch64, x86-64)。
+**v0.6** · 原生 **Scream UDP → Diretta SDK** 桥接器，适用于 Linux (aarch64, x86-64)。
 
 通过网络 UDP 接收来自远程机器（运行 ASIOScream / ScreamDriver / scream-alsa）的连续无压缩 PCM 流，并直接通过 Diretta Host SDK 转发到支持 Diretta 的 DAC —— **无需 ALSA、FFmpeg、UPnP 或任何中间软件层**。
 
@@ -228,6 +228,7 @@ sudo ./scream2diretta -t 1 -p 4011 \
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `--target, -t <index>` | 1 | 按 1-based 索引选择 Diretta 目标设备 |
+| `-L` | 关闭 | 使用原始 5 字节 Scream 头（legacy 模式）。ap2renderer、ASIOScream 以及旧版 scream-alsa 会发送字节交织的 DSD 和旧的 rate 编码，需要加此开关。 |
 | `--list-targets` | — | 发现并列出目标设备 |
 | `-p <port>` | 4010 | Scream UDP 端口 |
 | `-i <iface>` | — | 绑定到指定网络接口 |
@@ -318,18 +319,49 @@ transfer: mtu=1518 mode=auto-varauto-cycle mode_sdk=variable target_cycle=800us 
 
 ## Scream 协议
 
-Scream 通过 UDP 发送原始无压缩 PCM：
+Scream 通过 UDP 发送原始无压缩 PCM 或 DSD。s2d 同时支持**扩展版 6 字节 ScreamALSA 头**（默认）和**原始 5 字节 Scream 头**（`-L` legacy 模式）。
+
+### 扩展头（默认）
+
+当前 ScreamALSA 驱动使用。支持 PCM 16/24/32-bit 以及最高 DSD512 的 DSD。
 
 ```
-Byte 0:    采样率代码
-Byte 1:    位深度 (16 / 24 / 32)
-Byte 2:    声道数
-Byte 3:    声道映射
-Byte 4+:   交错 PCM 采样 (小端有符号)
+Byte 0:       采样率倍频（低 8 位）
+Byte 1:       采样位深（16 / 24 / 32，或 1 表示 DSD）
+Byte 2:       声道数
+Byte 3:       声道映射
+Byte 4:       位 3:0 = 采样率倍频高位
+              位 4    = 0 -> 48k 族，1 -> 44.1k 族
+              位 7    = 曲目结束标记
+Byte 5:       wire_layout（0 = 打包 S24_3LE，1 = S24_LE 4 字节容器）
+Byte 6+:      交错采样
 ```
+
+24-bit PCM 的 `wire_layout` 字节区分两种容器：
+- `0` — 打包 3 字节小端（`S24_3LE`）。这是 Diretta SDK 以
+  `FMT_PCM_SIGNED_24` 原生消费的格式。
+- `1` — 32-bit 小端容器中的 24-bit 样本（`S24_LE`）。s2d 在入队前
+  剥离填充字节，使队列中仍是打包的 S24_3LE。该转换无损，并在
+  接收线程中完成。
+
+### Legacy 头（`-L`）
+
+原始 Scream 驱动、ap2renderer 和 ASIOScream 使用。
+
+```
+Byte 0: 采样率代码（>=128 -> 44100*(code-128)，否则 48000*code）
+Byte 1: 采样位深（16 / 24 / 32，或 1 表示 DSD）
+Byte 2: 声道数
+Byte 3: 声道映射低字节
+Byte 4: 声道映射高字节
+Byte 5+: 交错采样
+```
+
+Legacy DSD 以字节交织方式发送；s2d 在交给 Diretta SDK 之前会将其
+反交织为标准 ALSA `DSD_U32_BE` 的字顺序。
 
 - 无序列号，无重传 —— 纯 UDP。
-- 格式变化通过字节 0-3 的变化检测。
+- 格式变化通过头字节变化检测。
 - 连续流，无曲目边界。
 
 ---
