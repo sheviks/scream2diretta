@@ -1,6 +1,6 @@
 # scream2diretta
 
-**v0.7** · A native **Scream UDP → Diretta SDK** bridge for Linux (aarch64, x86-64).
+**v0.8** · A native **Scream UDP → Diretta SDK** bridge for Linux (aarch64, x86-64).
 
 Receives a continuous uncompressed PCM stream from a remote machine running ASIOScream / ScreamDriver / scream-alsa over UDP, and forwards it directly to a Diretta-capable DAC via the Diretta Host SDK — **without ALSA, FFmpeg, UPnP, or any intermediate software layer**.
 
@@ -116,7 +116,7 @@ After all, You can also use **aprenderer / aplayer** (Windows / Linux) as the Sc
 
 - C++17 compiler (gcc 11+, clang 13+)
 - CMake 3.7+
-- Diretta Host SDK (e.g. `DirettaHostSDK_149`) — see [DirettaRendererUPnP](https://github.com/cometdom/DirettaRendererUPnP) or [slim2Diretta](https://github.com/cometdom/slim2Diretta) for acquisition instructions
+- Diretta Host SDK (e.g. `DirettaHostSDK_150`) — see [DirettaRendererUPnP](https://github.com/cometdom/DirettaRendererUPnP) or [slim2Diretta](https://github.com/cometdom/slim2Diretta) for acquisition instructions
 
 If you need to build **ScreamAlsa** from source, see the [ScreamAlsa project](https://github.com/Scream-Projects/scream-alsa).
 
@@ -150,12 +150,12 @@ bash scripts/install.sh --uninstall # Remove binary and service
 mkdir build && cd build
 
 # Basic build (auto-detects architecture)
-cmake -DDIRETTA_ENABLE=ON -DDIRETTA_SDK_ROOT=../DirettaHostSDK_149 ..
+cmake -DDIRETTA_ENABLE=ON -DDIRETTA_SDK_ROOT=../DirettaHostSDK_150 ..
 make -j$(nproc)
 
 # Full-featured build (explicit arch, no SDK logging)
 cmake -DDIRETTA_ENABLE=ON \
-      -DDIRETTA_SDK_ROOT=../DirettaHostSDK_149 \
+      -DDIRETTA_SDK_ROOT=../DirettaHostSDK_150 \
       -DDIRETTA_ARCH_SUFFIX=aarch64-linux-15k16 \
       -DDIRETTA_NOLOG=ON \
       ..

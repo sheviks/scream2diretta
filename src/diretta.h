@@ -53,7 +53,7 @@ typedef enum diretta_transfer_mode_e {
     DIRETTA_TM_AUTOFIX,     /* configTransferFixAuto when cycletime set, else auto B-branch */
 } diretta_transfer_mode_t;
 
-/* Logging verbosity mapped onto SDK SysLog level. */
+/* SDK SysLog floor when --diretta-debug is off. -v/-vv do not raise this. */
 typedef enum diretta_log_level_e {
     DIRETTA_LOG_DEFAULT = 0,    /* Notice */
     DIRETTA_LOG_DEBUG,          /* Debug  */
@@ -66,7 +66,6 @@ typedef struct diretta_config_s {
     int target_index;
 
     /* Steady-state runtime tunables. */
-    int target_buffer_ms;       /* default 0 (SDK default) */
     unsigned thread_mode;       /* SDK Sync::THRED_MODE bitmask, default 1=CRITICAL */
     int cycle_us;               /* target/max cycle in us. 0 = auto. range 333..10000 enforced */
     int cycle_min_us;           /* min cycle for random mode, 0 = auto */
@@ -83,41 +82,10 @@ typedef struct diretta_config_s {
      *                    PCM (default 500). Below threshold the SDK gets
      *                    silence; the head of the track waits in the queue.
      *   rebuffer_percent if >0, after an underrun hold silence until the
-     *                    queue refills to this fraction (default 0.50)
-     *   startup_queue_ms startup gate threshold (ms). Effective open-
-     *                    time gate = max(prefill_ms, startup_queue_ms).
-     *                    Default 0 (use prefill_ms only). Raise this to
-     *                    require a deeper queue at fresh-Sync open without
-     *                    affecting steady-state prefill behaviour. */
+     *                    queue refills to this fraction (default 0.50) */
     int ring_buffer_ms;
     int prefill_ms;
     float rebuffer_percent;
-    /*  absolute rebuffer target (ms) used specifically after an
-     * underrun. When > 0 this overrides rebuffer_percent during the
-     * underrun recovery hold, so a single transient hiccup recovers after
-     * accumulating ~underrun_rebuffer_ms of audio instead of refilling to
-     * 50% of the ring (~500 ms at default ring_buffer_ms=1000). 0 (default
-     * behaviour) falls back to rebuffer_percent. Range 0..5000. */
-    int underrun_rebuffer_ms;
-    int startup_queue_ms;
-    /*  minimum number of getNewStream cycles, expressed in ms of audio,
-     * during which the Sync MUST output zero PCM after a fresh open. Acts as
-     * a forced silent warmup that runs through real Diretta pull cycles --
-     * letting the target / DAC settle on silence before any real PCM lands.
-     * 0 disables it (= default behaviour and the default). Range 0..2000. */
-    int startup_mute_ms;
-
-    /*  optional post-play startup "real delay" window (ms). When >0,
-     * after the Sync has been play()'d and the prefill gate would normally
-     * release, the SDK pull (getNewStream) emits silence for this many ms
-     * of real pull cycles BEFORE the first real PCM byte is popped from
-     * the unified queue. Unlike --startup-mute-ms, the queue is
-     * NOT consumed during this window -- the head of the track waits
-     * intact while the target/DAC settles on silence. Adds latency
-     * deterministically (no audio is lost). Diagnostic option to test
-     * whether the residual subtle artifact is caused by target/DAC
-     * stabilization after play. 0 (default) = disabled. Range 0..5000. */
-    int startup_real_delay_ms;
 
     /*  format-change cooldown in milliseconds. Replaces the hardcoded
      * 1200 ms used in earlier builds. After tearing down an old Sync we wait this
@@ -156,12 +124,9 @@ typedef struct diretta_config_s {
 
     /* DSD-specific buffer tuning. Scream signals DSD via sample_size==1.
      * dsd_buffer_ms         : ring size for DSD (default 1500).
-     * dsd_prefill_ms        : prefill gate for DSD (default 200).
-     * dsd_startup_warmup_ms : base silent warmup after DSD open, scaled by
-     *                         dsd_multiplier at runtime (default 50). */
+     * dsd_prefill_ms        : prefill gate for DSD (default 200). */
     int dsd_buffer_ms;
     int dsd_prefill_ms;
-    int dsd_startup_warmup_ms;
 
     /* Periodic producer-side stats reporting in seconds. 0 = off (only the
      * one-shot shutdown summary at -v / explicit stats is printed). When >0
@@ -184,8 +149,8 @@ typedef struct diretta_config_s {
      * Ingress = PCM as written into the unified queue (post frame-align,
      *           post partial-carry). Captures what came off the wire.
      * Egress  = PCM popped from the unified queue and handed to the SDK
-     *           (real-PCM cycles only). Silence emitted by the prefill /
-     *           startup-real-delay / mute gates is NOT written. */
+     *           (real-PCM cycles only). Silence emitted by the prefill
+     *           gate is NOT written. */
     const char* dump_ingress_prefix; /* NULL = disabled */
     const char* dump_egress_prefix;  /* NULL = disabled */
     int dump_ms;                     /* per-file capture cap in ms; 0 = uncapped */
@@ -258,12 +223,13 @@ typedef struct diretta_config_s {
      * first_getNewStream, first_real_pcm, format_change_cleanup_begin/_end,
      * setSink/setSinkConfigure/inquirySupportFormat/connectPrepare/play,
      * MTU + sink Info, target inquiry/profile params) with monotonic
-     * timestamps relative to the last format-change-accepted instant. It
-     * also forces the SDK's own SysLog level to Debug so the underlying
-     * library log lines are visible alongside ours.
+     * timestamps relative to the last format-change-accepted instant.
+     * Also hooks DIRETTA::SysLogDiretta at Debug through ACQUA's StdErrOut
+     * callback so Host SDK lines (info rcv / FEEDBACK) appear as `[sdk] `
+     * on stderr — the same stream as other [diretta] messages. port=0
+     * disables logcatch UDP. No-op with a -nolog archive.
      *
-     * Independent of -v / -vv. Default 0 (off). Output goes to stderr
-     * (same stream as other [diretta] messages). */
+     * Independent of -v / -vv. Default 0 (off). */
     int diretta_debug;
 } diretta_config_t;
 

@@ -138,15 +138,11 @@ void ScreamDirettaSync::configureFormat(uint32_t sampleRate,
     const uint8_t silence = (m_ring ? m_ring->silenceByte() : 0x00);
     m_silenceByte.store(silence, std::memory_order_release);
 
-    // Prefill / startup gate target in bytes. Effective threshold is
-    // max(prefill_ms, startup_queue_ms) so callers can override the open-
-    // time gate independently of steady-state prefill, but the default
-    // (startup_queue_ms == 0) preserves prior behaviour exactly.
+    // Prefill gate target in bytes. The SDK emits silence until the ring
+    // holds this much audio, then pulls real PCM from cycle one.
     int prefillMs = tuning.prefill_ms;
     if (prefillMs < 0) prefillMs = 0;
-    int startupMs = tuning.startup_queue_ms;
-    if (startupMs < 0) startupMs = 0;
-    int gateMs = (startupMs > prefillMs) ? startupMs : prefillMs;
+    int gateMs = prefillMs;
     int ringMs = tuning.ring_buffer_ms;
     if (ringMs < 50)   ringMs = 50;
     if (ringMs > 5000) ringMs = 5000;
@@ -161,49 +157,6 @@ void ScreamDirettaSync::configureFormat(uint32_t sampleRate,
     if (pct < 0.0f) pct = 0.0f;
     if (pct > 0.95f) pct = 0.95f;
     m_rebufferPct.store(pct, std::memory_order_release);
-
-    //  absolute underrun-rebuffer target in bytes (from
-    // tuning.underrun_rebuffer_ms). Clamped to the ring capacity. 0 means
-    // "fall back to rebuffer_percent". Used by Gate 2 in getNewStream().
-    int urMs = tuning.underrun_rebuffer_ms;
-    if (urMs < 0) urMs = 0;
-    size_t urBytes = (bytesPerSecond * static_cast<size_t>(urMs)) / 1000;
-    if (bytesPerFrame > 0 && urBytes > 0) {
-        urBytes = (urBytes / bytesPerFrame) * bytesPerFrame;
-    }
-    // Clamp to a bit under the ring so we can actually reach it.
-    if (m_ring) {
-        size_t cap = m_ring->capacity();
-        if (cap > 0 && urBytes > (cap - bytesPerFrame)) {
-            urBytes = (cap > bytesPerFrame * 2) ? (cap - bytesPerFrame * 2) : 0;
-        }
-    }
-    m_underrunRebufferBytes.store(urBytes, std::memory_order_release);
-
-    // Forced silent warmup. Convert ms -> bytes and clamp to the ring
-    // capacity-equivalent window (no need to clamp further; emitting silent
-    // cycles is a no-op on the queue). bytesPerFrame alignment matters only
-    // for the emit counter -- the silence pattern itself is a byte fill.
-    int muteMs = tuning.startup_mute_ms;
-    if (muteMs < 0)    muteMs = 0;
-    if (muteMs > 2000) muteMs = 2000;
-    size_t muteBytes = (bytesPerSecond * static_cast<size_t>(muteMs)) / 1000;
-    if (bytesPerFrame > 0) {
-        muteBytes = (muteBytes / bytesPerFrame) * bytesPerFrame;
-    }
-    m_muteBytes.store(muteBytes, std::memory_order_release);
-
-    // startup_real_delay window: silence cycles AFTER the prefill gate
-    // releases, without consuming the queue. Convert ms -> bytes aligned to
-    // frame size.
-    int realDelayMs = tuning.startup_real_delay_ms;
-    if (realDelayMs < 0)    realDelayMs = 0;
-    if (realDelayMs > 5000) realDelayMs = 5000;
-    size_t realDelayBytes = (bytesPerSecond * static_cast<size_t>(realDelayMs)) / 1000;
-    if (bytesPerFrame > 0) {
-        realDelayBytes = (realDelayBytes / bytesPerFrame) * bytesPerFrame;
-    }
-    m_realDelayBytes.store(realDelayBytes, std::memory_order_release);
 
     // Cycle size from the SDK is the number of bytes the send thread will ask
     // for each call. getCycleSize() is valid as soon as setSinkConfigure()
@@ -259,16 +212,9 @@ void ScreamDirettaSync::resetGate() {
     m_streamCount.store(0, std::memory_order_release);
     m_silentCycles.store(0, std::memory_order_release);
     m_realCycles.store(0, std::memory_order_release);
-    m_muteBytesEmitted.store(0, std::memory_order_release);
-    const size_t target = m_muteBytes.load(std::memory_order_acquire);
-    m_muteDone.store(target == 0, std::memory_order_release);
     m_underrunEvents.store(0, std::memory_order_release);
     m_rebufferTargetBytes.store(0, std::memory_order_release);
     m_poppedBytes.store(0, std::memory_order_release);
-    m_realDelayEmitted.store(0, std::memory_order_release);
-    m_realDelayCycles.store(0, std::memory_order_release);
-    const size_t realDelayTarget = m_realDelayBytes.load(std::memory_order_acquire);
-    m_realDelayDone.store(realDelayTarget == 0, std::memory_order_release);
 }
 
 bool ScreamDirettaSync::getNewStream(diretta_stream& s) {
@@ -372,16 +318,15 @@ bool ScreamDirettaSync::getNewStream(diretta_stream& s) {
     const uint8_t silence = m_silenceByte.load(std::memory_order_acquire);
     m_streamCount.fetch_add(1, std::memory_order_relaxed);
 
-    // Fast path: once all four startup gates have passed at least once
-    // and a real-PCM pop has succeeded, m_steadyState is latched true.
+    // Fast path: once the prefill gate has passed at least once and a
+    // real-PCM pop has succeeded, m_steadyState is latched true.
     // Until an underrun or a reconfigure clears it, every cycle takes
     // this single-load path and skips the gate cascade entirely.
     //
     // The acquire here pairs with the release at the slow-path tail
     // where m_steadyState is set; observing true also makes all prior
-    // gate stores (m_muteDone, m_prefillDone, m_realDelayDone,
-    // m_rebuffering=false) visible to this thread, so the gate cascade
-    // is provably redundant on this path.
+    // gate stores (m_prefillDone, m_rebuffering=false) visible to this
+    // thread, so the gate cascade is provably redundant on this path.
     //
     // Underrun handling stays here: if the ring cannot satisfy a full
     // cycle, drop the flag and fall through to the slow path so Gate 3
@@ -418,28 +363,6 @@ bool ScreamDirettaSync::getNewStream(diretta_stream& s) {
         // fall through to Gate 3
     }
 
-    // Gate 0: forced silent warmup. Until we have emitted muteBytes
-    // worth of zero PCM through real Diretta pull cycles, every cycle is
-    // silent and does NOT pop the ring. This sits BEFORE the prefill gate
-    // so even if the queue is already huge at open() time (e.g. ~1.2s
-    // accumulated during the format-change cooldown), the target/DAC sees
-    // genuine silent cycles first. Click mitigation that the fill-only
-    // gate cannot provide.
-    if (__builtin_expect(!m_muteDone.load(std::memory_order_acquire), 0)) {
-        const size_t target = m_muteBytes.load(std::memory_order_acquire);
-        std::memset(dest, silence, want);
-        m_silentCycles.fetch_add(1, std::memory_order_relaxed);
-        if (target == 0) {
-            m_muteDone.store(true, std::memory_order_release);
-        } else {
-            size_t emitted = m_muteBytesEmitted.fetch_add(want, std::memory_order_relaxed) + want;
-            if (emitted >= target) {
-                m_muteDone.store(true, std::memory_order_release);
-            }
-        }
-        return true;
-    }
-
     // Gate 1: still in startup priming. The queue is filling but has not
     // reached the configured threshold yet. Emit silence WITHOUT popping
     // from the ring so the head of the track survives. This is what makes
@@ -457,32 +380,8 @@ bool ScreamDirettaSync::getNewStream(diretta_stream& s) {
         }
     }
 
-    // Gate 1.5: startup_real_delay. After the prefill gate releases
-    // (queue has enough audio), still emit silence for a configurable
-    // window WITHOUT popping from the ring. The head of the track waits
-    // intact; the target/DAC sees silence cycles to settle on. This
-    // differs from the startup_mute (Gate 0) which sits before the
-    // prefill gate; here we know the queue is primed and just delay the
-    // first real PCM byte deterministically.
-    if (__builtin_expect(!m_realDelayDone.load(std::memory_order_acquire), 0)) {
-        const size_t target = m_realDelayBytes.load(std::memory_order_acquire);
-        if (target == 0) {
-            m_realDelayDone.store(true, std::memory_order_release);
-        } else {
-            std::memset(dest, silence, want);
-            m_silentCycles.fetch_add(1, std::memory_order_relaxed);
-            m_realDelayCycles.fetch_add(1, std::memory_order_relaxed);
-            const size_t emitted = m_realDelayEmitted.fetch_add(want, std::memory_order_relaxed) + want;
-            if (emitted >= target) {
-                m_realDelayDone.store(true, std::memory_order_release);
-            }
-            return true;
-        }
-    }
-
     // Gate 2: rebuffering after a sustained underrun. Hold silence until
-    // queue fill recovers to the armed target ( prefer the absolute
-    // underrun_rebuffer_ms target if configured, else rebuffer_percent).
+    // queue fill recovers to rebuffer_percent of ring capacity.
     if (__builtin_expect(m_rebuffering.load(std::memory_order_acquire), 0)) {
         const size_t threshold = m_rebufferTargetBytes.load(std::memory_order_acquire);
         if (m_ring->available() >= threshold) {
@@ -496,18 +395,13 @@ bool ScreamDirettaSync::getNewStream(diretta_stream& s) {
     }
 
     // Gate 3: arm rebuffering if a single cycle cannot be satisfied.
-    // pick the rebuffer target. Prefer the absolute byte target derived
-    // from underrun_rebuffer_ms (smaller, faster recovery for transient
-    // hiccups); else use the rebuffer_percent of capacity. We arm
-    // the gate even when both knobs evaluate to 0 bytes so the underrun
-    // event count stays meaningful -- but in that case we recover next
-    // cycle (threshold == 0 always satisfied).
+    // Target is rebuffer_percent of ring capacity. We arm the gate even
+    // when the percent evaluates to 0 bytes so the underrun event count
+    // stays meaningful -- but in that case we recover next cycle
+    // (threshold == 0 always satisfied).
     if (__builtin_expect(m_ring->available() < want, 0)) {
-        size_t target = m_underrunRebufferBytes.load(std::memory_order_acquire);
-        if (target == 0) {
-            const float pct = m_rebufferPct.load(std::memory_order_acquire);
-            target = static_cast<size_t>(m_ring->capacity() * pct);
-        }
+        const float pct = m_rebufferPct.load(std::memory_order_acquire);
+        const size_t target = static_cast<size_t>(m_ring->capacity() * pct);
         m_rebufferTargetBytes.store(target, std::memory_order_release);
         m_rebuffering.store(true, std::memory_order_release);
         m_underrunEvents.fetch_add(1, std::memory_order_relaxed);
@@ -551,8 +445,8 @@ bool ScreamDirettaSync::getNewStream(diretta_stream& s) {
     m_poppedBytes.fetch_add(want, std::memory_order_relaxed);
     m_realCycles.fetch_add(1, std::memory_order_relaxed);
     // Latch steady-state. Reaching this point proves: m_active=true,
-    // m_muteDone=true, m_prefillDone=true, m_realDelayDone=true,
-    // m_rebuffering=false, AND ring->available() >= want. The release
+    // m_prefillDone=true, m_rebuffering=false, AND ring->available() >= want.
+    // The release
     // pairs with the fast-path acquire and makes those gate states
     // visible to the next cycle's reader (this same thread, but the
     // pairing is still required by the C++ memory model).

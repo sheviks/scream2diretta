@@ -56,16 +56,20 @@ confirm() {
 
 detect_arch_name() {
     local arch=$(uname -m)
-    # Kernel baseline: SDK ships "15" (kernel 5.x baseline) and "16" (kernel 6.x baseline).
-    # Pick "16" when running a 6.x or newer kernel; otherwise "15".
-    local kernel_major=$(uname -r 2>/dev/null | cut -d. -f1)
+    # SDK ships GCC15 ("15...") and GCC16 ("16...") static libraries.
+    # Default to GCC15 variants: a GCC16-built .a linked on an older
+    # libstdc++ can fail at runtime (GLIBCXX_3.4.xx not found). GCC16
+    # variants are selected only when the host gcc major is >= 16, or
+    # when the user exports ARCH_NAME explicitly.
+    local gcc_major
+    gcc_major=$(gcc -dumpversion 2>/dev/null | cut -d. -f1)
     local kbase="15"
-    if [ -n "$kernel_major" ] && [ "$kernel_major" -ge 6 ] 2>/dev/null; then
+    if [ -n "$gcc_major" ] && [ "$gcc_major" -ge 16 ] 2>/dev/null; then
         kbase="16"
     fi
     case "$arch" in
         x86_64)
-            # "16" baseline libs only exist for v3/v4/zen4 (no 16v2); fall back to 15v3.
+            # GCC16 libs only exist for v3/v4/zen4 (no 16v2); fall back to 15v3.
             if grep -q 'avx512f' /proc/cpuinfo 2>/dev/null; then
                 echo "x64-linux-${kbase}v4"
             elif grep -q 'avx2' /proc/cpuinfo 2>/dev/null; then
@@ -77,14 +81,12 @@ detect_arch_name() {
         aarch64)
             local page_size=$(getconf PAGE_SIZE 2>/dev/null || echo 4096)
             if [ "$kbase" = "16" ]; then
-                # Kernel-6 baseline ships both 16k4 and 16k16
                 if [ "$page_size" = "16384" ]; then
                     echo "aarch64-linux-16k16"
                 else
                     echo "aarch64-linux-16k4"
                 fi
             else
-                # Kernel-5 baseline only ships plain "15" (4K) and "15k16"
                 if [ "$page_size" = "16384" ]; then
                     echo "aarch64-linux-15k16"
                 else
@@ -123,17 +125,30 @@ detect_system() {
     fi
     ARCH=$(uname -m)
     print_info "Architecture: $ARCH"
-    ARCH_NAME=$(detect_arch_name)
-    if [ -n "$ARCH_NAME" ]; then
-        print_info "Auto-detected ARCH_NAME: $ARCH_NAME"
+    if [ -n "${ARCH_NAME:-}" ]; then
+        print_info "Using user-provided ARCH_NAME: $ARCH_NAME"
     else
-        print_warning "Could not auto-detect ARCH_NAME for $ARCH"
+        ARCH_NAME=$(detect_arch_name)
+        if [ -n "$ARCH_NAME" ]; then
+            print_info "Auto-detected ARCH_NAME: $ARCH_NAME"
+        else
+            print_warning "Could not auto-detect ARCH_NAME for $ARCH"
+        fi
     fi
 }
 
 detect_latest_sdk() {
-    # Search from known locations: project root, project parent, $HOME, /opt, /usr/local
-    local sdk_found=$(find "$SCRIPT_DIR" "$SCRIPT_DIR/.." "$HOME" /opt /usr/local \
+    # Prefer SDK 150 when present (required for the statusUpdate/connectWait
+    # handshake). Otherwise take the highest DirettaHostSDK_* by version sort.
+    local sdk_found=""
+    local loc
+    for loc in "$SCRIPT_DIR" "$SCRIPT_DIR/.." "$HOME" /opt /usr/local; do
+        if [ -d "$loc/DirettaHostSDK_150" ] && [ -d "$loc/DirettaHostSDK_150/lib" ]; then
+            echo "$(cd "$loc/DirettaHostSDK_150" && pwd)"
+            return
+        fi
+    done
+    sdk_found=$(find "$SCRIPT_DIR" "$SCRIPT_DIR/.." "$HOME" /opt /usr/local \
         -maxdepth 1 -type d -name 'DirettaHostSDK_*' 2>/dev/null | sort -V | tail -1 | xargs realpath 2>/dev/null)
     if [ -n "$sdk_found" ]; then
         echo "$sdk_found"
@@ -180,6 +195,11 @@ check_diretta_sdk() {
             local sdk_version=$(basename "$loc" | sed 's/DirettaHostSDK_//')
             print_success "Found Diretta SDK at: $SDK_PATH"
             [ -n "$sdk_version" ] && print_info "SDK version: $sdk_version"
+            if [ -n "$sdk_version" ] && [ "$sdk_version" -lt 150 ] 2>/dev/null; then
+                print_warning "SDK $sdk_version is older than 150. connectWait() may stall ~50s"
+                print_warning "unless statusUpdate() chains to DIRETTA::Sync::statusUpdate()."
+                print_info "Extract DirettaHostSDK_150 next to the source tree and re-run."
+            fi
             return 0
         fi
     done
@@ -225,10 +245,17 @@ build_scream2diretta() {
     export DIRETTA_SDK_PATH="$(realpath "$SDK_PATH")"
     cd build
     print_info "Configuring with CMake..."
+    print_info "SDK root: $DIRETTA_SDK_PATH"
     local cmake_args="-DDIRETTA_ENABLE=ON -DDIRETTA_SDK_ROOT=$DIRETTA_SDK_PATH"
     if [ -n "$ARCH_NAME" ]; then
         print_info "Using DIRETTA_ARCH_SUFFIX=$ARCH_NAME"
         cmake_args="$cmake_args -DDIRETTA_ARCH_SUFFIX=$ARCH_NAME"
+        local gcc_major
+        gcc_major=$(gcc -dumpversion 2>/dev/null | cut -d. -f1)
+        if echo "$ARCH_NAME" | grep -q -- '-16' && [ -n "$gcc_major" ] && [ "$gcc_major" -lt 16 ] 2>/dev/null; then
+            print_warning "ARCH_NAME=$ARCH_NAME is a GCC16 SDK variant, but host gcc is $gcc_major."
+            print_warning "Runtime may fail with missing GLIBCXX symbols. Prefer a 15* variant or gcc >= 16."
+        fi
     fi
     if [ "$USE_CLANG" -eq 1 ]; then
         print_info "Clang + lld detected; using Clang toolchain with LTO"

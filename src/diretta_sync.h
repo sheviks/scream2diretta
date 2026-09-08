@@ -7,7 +7,7 @@
 // handshake / steady state). The Diretta SDK send thread pulls from the
 // queue via this Sync's getNewStream(), subject to a prefill / rebuffer
 // gate so the very first cycles output silence until the queue has
-// accumulated startup_queue_ms (or prefill_ms) of PCM.
+// accumulated prefill_ms of PCM.
 //
 // The ring is externally owned so it can persist across Sync open/close.
 // Format changes rebuild the backend-owned queue once, and the new Sync reads
@@ -43,32 +43,6 @@ struct SyncTuning {
     // After an underrun we hold silence until this fraction of the ring is
     // filled. 0 disables rebuffering (let underruns be handled per-buffer).
     float rebuffer_percent = 0.5f;
-    //  absolute rebuffer target in ms after an underrun. When >0 this
-    // OVERRIDES rebuffer_percent during the underrun recovery hold so a
-    // small transient hiccup does not force a refill to half the ring (~500
-    // ms at default ring_buffer_ms=1000). 0 disables the override and falls
-    // back to rebuffer_percent. Range conceptually 0..ring_buffer_ms.
-    int underrun_rebuffer_ms = 0;
-    //  minimum queue fill (ms) required before getNewStream outputs
-    // real PCM after a fresh Sync open. Defaults to prefill_ms. Allows
-    // overriding the startup gate threshold independently of steady-state
-    // prefill semantics. Effective threshold = max(prefill_ms,
-    // startup_queue_ms). 0 means "fall back to prefill_ms only".
-    int startup_queue_ms = 0;
-    // Compatibility: forced silent-warmup window (ms). After a
-    // fresh Sync open the SDK send thread will output zero PCM (real
-    // Diretta pull cycles, not a preload) for this duration BEFORE the
-    // prefill/queue gate is allowed to open. Default is 0; the current
-    // startup path defers the Sync open itself
-    // (diretta.cpp open-fill gate) instead of muting after open. Kept
-    // for CLI back-compat; not recommended.
-    int startup_mute_ms = 0;
-    //  post-play "real delay" window (ms). After the prefill gate
-    // would release, getNewStream() emits silence for this many ms of
-    // real pull cycles WITHOUT popping from the ring. The head of the
-    // track waits intact -- audio is delayed, not dropped. Defaults to 0
-    // (disabled). Diagnostic for target/DAC stabilization after play.
-    int startup_real_delay_ms = 0;
 };
 
 // Inherits directly from DIRETTA::Sync (not SyncBuffer). The SDK's TestSync
@@ -142,14 +116,12 @@ public:
     bool     prefillDone()    const { return m_prefillDone.load(std::memory_order_acquire); }
     bool     rebuffering()    const { return m_rebuffering.load(std::memory_order_acquire); }
     size_t   prefillBytes()   const { return m_prefillBytes.load(std::memory_order_acquire); }
-    bool     muteDone()       const { return m_muteDone.load(std::memory_order_acquire); }
     //  bytes consumed (popped) from the ring. Used by stats interval
     // logging to derive drain rate without snooping ring internals.
     uint64_t poppedBytes()   const { return m_poppedBytes.load(std::memory_order_acquire); }
     //  per-Sync underrun and rebuffer accounting. underrunEvents counts
     // distinct underrun episodes (one per begin); rebufferTargetBytes is the
-    // effective threshold (max(percent*cap, underrun_rebuffer_ms-bytes))
-    // currently armed for the rebuffering hold.
+    // rebuffer_percent of ring capacity armed for the rebuffering hold.
     uint64_t underrunEvents()      const { return m_underrunEvents.load(std::memory_order_acquire); }
     size_t   rebufferTargetBytes() const { return m_rebufferTargetBytes.load(std::memory_order_acquire); }
 
@@ -164,25 +136,14 @@ protected:
     // SDK pull-mode callback. Single override needed.
     bool getNewStream(diretta_stream& s) override;
 
-    // SDK info-exchange callback. Intentionally left empty.
-    //
-    // Diretta Host SDK 149 does NOT invoke statusUpdate() in practice: the
-    // SDK<->Target info/feedback exchange (verified at ~10 Hz on the wire,
-    // 48B info + 16B feedback packets per --info-cycle) is consumed entirely
-    // inside the SDK to drive cycle adaptation / feedback averaging, and the
-    // upper-layer hook is never called. Relying on it for telemetry produced
-    // a permanently silent log. DRUP overrides this the same way: `{}`.
-    //
-    // NOTE: SDK 149 exposes NO way to read live Target runtime state from the
-    // application layer. statusUpdate() (the only push hook) is dead, and the
-    // const getters getCycleTime()/getMinCycleTime()/getCycleSize()/
-    // getCyclePackets()/getMode() return the *host-side negotiated send
-    // profile* captured at sink-open/re-negotiation -- a static snapshot, not
-    // live Target telemetry. They only change on format re-negotiation and
-    // are already printed once at open, so polling them adds no information.
-    // A '--target-info' polling option was prototyped and then removed for
-    // exactly this reason.
-    void statusUpdate() override {}
+    // SDK connection-state hook. This is NOT live Target telemetry
+    // (DAC PLL, buffer fill, etc. are still not exposed). On SDK 150 the
+    // base implementation wakes connectWait() when the handshake completes;
+    // an empty override swallows that wakeup and connectWait() sits out its
+    // full internal timeout (~50s) even though the Target is already online.
+    // Yu Harada / DRUP 2.5.15: derived classes MUST chain to the base.
+    // Getters such as getCycleTime() remain a host-side send-profile snapshot.
+    void statusUpdate() override { DIRETTA::Sync::statusUpdate(); }
 
 private:
     // Externally owned. Owner (DirettaState) guarantees the pointer remains
@@ -214,7 +175,8 @@ private:
 
     //  egress PCM dumper. Owned by DirettaState in diretta.cpp; the
     // Sync just calls pcm_dumper_write() from getNewStream() when the cycle
-    // returns real PCM (silence emitted by Gate 0/1/1.5/2 is NOT written).
+    // returns real PCM (silence from teardown / prefill / rebuffer gates
+    // is NOT written).
     pcm_dumper_t* m_egress_dumper = nullptr;
     uint32_t m_egress_rate = 0;
     uint32_t m_egress_channels = 0;
@@ -249,8 +211,7 @@ private:
     std::atomic<bool> m_prefillDone{false};
     std::atomic<bool> m_rebuffering{false};
 
-    // Fast-path flag. Once all four startup gates (mute / prefill /
-    // real_delay / rebuffer-clear) have passed at least once and a
+    // Fast-path flag. Once the prefill gate has passed at least once and a
     // normal real-PCM pop has succeeded, getNewStream() flips this
     // to true and subsequent cycles take a single-load fast path
     // that skips the gate cascade. Gate 3 (underrun) clears it so
@@ -271,15 +232,6 @@ private:
         m_steadyState.store(false, std::memory_order_release);
     }
 
-    // Startup mute gate. m_muteBytes is the silent-warmup target in
-    // bytes (computed from sample rate and the configured ms). The mute
-    // gate sits BEFORE the prefill gate: until m_muteDone is true, every
-    // getNewStream cycle outputs silence (no pop from the ring) regardless
-    // of ring fill.
-    std::atomic<size_t> m_muteBytes{0};
-    std::atomic<size_t> m_muteBytesEmitted{0};
-    std::atomic<bool>   m_muteDone{true};   // true == no mute requested
-
     // Persistent buffer the SDK reads from; resized on configureFormat to
     // match getCycleSize() (plus one extra frame for drift compensation)
     // so getNewStream() never allocates.
@@ -292,31 +244,13 @@ private:
 
     // Underrun tracking. m_underrunEvents counts the number of times we
     // transitioned from "ok" to "rebuffering" (i.e. distinct underrun
-    // episodes). m_underrunRebufferBytes is the configured absolute target
-    // in bytes (from underrun_rebuffer_ms), or 0 to fall back to percent.
-    // m_rebufferTargetBytes is whichever target is currently armed.
+    // episodes). m_rebufferTargetBytes is the percent-of-capacity target
+    // currently armed.
     std::atomic<uint64_t> m_underrunEvents{0};
-    std::atomic<size_t>   m_underrunRebufferBytes{0};
     std::atomic<size_t>   m_rebufferTargetBytes{0};
     // Drain accounting: bytes the SDK has popped from the ring through
     // this Sync. Counts real-PCM pops only (silence cycles do not pop).
     std::atomic<uint64_t> m_poppedBytes{0};
-
-    // startup_real_delay gate. After the prefill gate has released
-    // (queue >= prefill_ms), getNewStream() will still emit silence
-    // without popping the ring for m_realDelayBytes worth of audio, so
-    // the target/DAC can settle on silence before the first real PCM is
-    // popped. Queue is NOT consumed during this window. m_realDelayDone
-    // is true if the feature is disabled (target == 0).
-    std::atomic<size_t>   m_realDelayBytes{0};
-    std::atomic<size_t>   m_realDelayEmitted{0};
-    std::atomic<bool>     m_realDelayDone{true};
-    std::atomic<uint64_t> m_realDelayCycles{0};
-public:
-    size_t   realDelayBytes()         const { return m_realDelayBytes.load(std::memory_order_acquire); }
-    size_t   realDelayBytesEmitted()  const { return m_realDelayEmitted.load(std::memory_order_acquire); }
-    bool     realDelayDone()          const { return m_realDelayDone.load(std::memory_order_acquire); }
-    uint64_t realDelayCycles()        const { return m_realDelayCycles.load(std::memory_order_acquire); }
 };
 
 } // namespace scream_diretta

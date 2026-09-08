@@ -7,9 +7,8 @@
 //              post partial-carry) -- captures what came off the wire.
 //   * egress:  PCM as popped from the unified queue and handed to the SDK
 //              -- captures what the Diretta layer is about to send to the
-//              target. Silence emitted by the prefill / startup-real-delay
-//              gates is NOT written; only real-PCM bytes returned by
-//              popOrSilence().
+//              target. Silence emitted by the prefill gate is not dumped;
+//              only real-PCM bytes returned by popOrSilence().
 //
 // The dumper is single-producer per instance (ingress is written only from
 // the receive thread; egress only from the SDK send thread) so no locking

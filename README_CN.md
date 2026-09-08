@@ -1,6 +1,6 @@
 # scream2diretta
 
-**v0.7** · 原生 **Scream UDP → Diretta SDK** 桥接器，适用于 Linux (aarch64, x86-64)。
+**v0.8** · 原生 **Scream UDP → Diretta SDK** 桥接器，适用于 Linux (aarch64, x86-64)。
 
 通过网络 UDP 接收来自远程机器（运行 ASIOScream / ScreamDriver / scream-alsa）的连续无压缩 PCM 流，并直接通过 Diretta Host SDK 转发到支持 Diretta 的 DAC —— **无需 ALSA、FFmpeg、UPnP 或任何中间软件层**。
 
@@ -116,7 +116,7 @@ LMS/Roon → upmpdcli → MPD → CamillaDSP → ScreamAlsa
 
 - C++17 编译器 (gcc 11+, clang 13+)
 - CMake 3.7+
-- Diretta Host SDK (如 `DirettaHostSDK_149`) —— 获取方式参见 [DirettaRendererUPnP](https://github.com/cometdom/DirettaRendererUPnP) 或 [slim2Diretta](https://github.com/cometdom/slim2Diretta) 项目主页
+- Diretta Host SDK (如 `DirettaHostSDK_150`) —— 获取方式参见 [DirettaRendererUPnP](https://github.com/cometdom/DirettaRendererUPnP) 或 [slim2Diretta](https://github.com/cometdom/slim2Diretta) 项目主页
 
 如需自行编译 **ScreamAlsa**，请前往 [ScreamAlsa 项目](https://github.com/Scream-Projects/scream-alsa)。
 
@@ -150,12 +150,12 @@ bash scripts/install.sh --uninstall # 移除二进制文件和服务
 mkdir build && cd build
 
 # 基础编译 (自动检测架构)
-cmake -DDIRETTA_ENABLE=ON -DDIRETTA_SDK_ROOT=../DirettaHostSDK_149 ..
+cmake -DDIRETTA_ENABLE=ON -DDIRETTA_SDK_ROOT=../DirettaHostSDK_150 ..
 make -j$(nproc)
 
 # 完整编译 (指定架构、关闭 SDK 日志)
 cmake -DDIRETTA_ENABLE=ON \
-      -DDIRETTA_SDK_ROOT=../DirettaHostSDK_149 \
+      -DDIRETTA_SDK_ROOT=../DirettaHostSDK_150 \
       -DDIRETTA_ARCH_SUFFIX=aarch64-linux-15k16 \
       -DDIRETTA_NOLOG=ON \
       ..

@@ -6,6 +6,69 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [Unreleased]
+
+---
+
+## [0.8.0] - 2026-09-08
+
+### Summary
+
+Host SDK 150 handshake and logging, plus a first-cut cleanup of leftover
+startup/underrun knobs. Transfer-mode options and the 50 ms open-path
+pacing sleeps are unchanged.
+
+### Fixed
+
+- **SDK 150 `connectWait()` stall: chain `statusUpdate()` to the base class.**
+  An empty `ScreamDirettaSync::statusUpdate()` override swallowed the SDK
+  notification that `connectWait()` waits on. On Host SDK 150 that wakeup is
+  required; without it the UDP handshake can finish in ~1s while `connectWait()`
+  sits out its full internal timeout (~50s). Matches Yu Harada / DRUP 2.5.15:
+  `void statusUpdate() override { DIRETTA::Sync::statusUpdate(); }`.
+  (`diretta_sync.h`)
+
+### Changed
+
+- **Version bump to 0.8** across `CMakeLists.txt`, `README.md`,
+  `README_CN.md`, and the fallback `SCREAM2DIRETTA_VERSION` macro.
+- **Install / CMake prefer Diretta Host SDK 150.** `scripts/install.sh` looks
+  for `DirettaHostSDK_150` first, warns if a pre-150 tree is selected, and
+  picks GCC15 vs GCC16 library variants from `gcc -dumpversion` (not kernel
+  major). CMake docs/error text now name SDK 150. (`scripts/install.sh`,
+  `CMakeLists.txt`)
+- **SDK 150 `is_MSmode()`: log the live negotiated multi-stream mode.**
+  Pre-150 s2d inferred MS1/MS3 from `getSinkInfo().supportMSmode` capability
+  bits at inquiry time. After `connectWait()` + the online poll, s2d now
+  reports `Sync::is_MSmode()` (`MSmodeSet`). Inquiry still logs the
+  capability bitmask as `ms_supported`. Logging only; `open()` still
+  requests `MSMODE_AUTO`. (`diretta.cpp`)
+- **`--diretta-debug` attaches Host SDK SysLog to stderr via callback.**
+  The SDK "stdout" path is fully buffered when systemd appends to a file,
+  so `info rcv` / `FEEDBACK` never showed up in `tail -f`. s2d now
+  registers `ACQUA::SysLog::initialize(facility, StdErrOut)` and prefixes
+  lines with `[sdk]`. No-op with a `-nolog` archive. (`diretta.cpp`)
+- **`-v`/`-vv` no longer raise Host SDK SysLog to Debug.**
+  SDK Debug output (`info rcv` / `FEEDBACK`) is `--diretta-debug` only.
+  `-v`/`-vv` still control s2d's own `[diretta]` / `[diretta-phase]`
+  lines. (`scream.c`, `diretta.cpp`)
+
+### Removed
+
+- **Leftover startup/underrun knobs and CLI aliases.**
+  `--startup-mute-ms`, `--startup-real-delay-ms`, `--startup-queue-ms`,
+  `--dsd-startup-warmup-ms`, `--underrun-rebuffer-ms`,
+  `--underrun-rebuffer-percent`, and the `--ring-buffer-ms` /
+  `--prefill-ms` aliases. Mute and real-delay gates in `getNewStream()`
+  are gone; open/prefill is `--pcm-prefill-ms` (or `--dsd-prefill-ms`)
+  only; underrun recovery is `--rebuffer-percent` only. `setSink` always
+  passes a zero Clock (SDK/Target default buffer). Scripts still using
+  the old flags will fail with `unrecognized option`.
+  (`scream.c`, `diretta.h`, `diretta.cpp`, `diretta_sync.h`,
+  `diretta_sync.cpp`)
+
+---
+
 ## [0.7.0] - 2026-07-21
 
 ### Summary

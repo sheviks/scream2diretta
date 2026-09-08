@@ -29,7 +29,7 @@
 #endif
 
 #ifndef SCREAM2DIRETTA_VERSION
-#define SCREAM2DIRETTA_VERSION "0.7"
+#define SCREAM2DIRETTA_VERSION "0.8"
 #endif
 
 #if DIRETTA_ENABLE
@@ -135,8 +135,6 @@ static void show_usage(const char *arg0)
   fprintf(stderr, "DSD buffering (used when Scream sender signals DSD via sample_size==1):\n");
   fprintf(stderr, "  --dsd-buffer-ms <ms>         DSD ring length in ms (default 1500, range 50..5000).\n");
   fprintf(stderr, "  --dsd-prefill-ms <ms>        DSD open-gate threshold (default 200, range 0..5000).\n");
-  fprintf(stderr, "  --dsd-startup-warmup-ms <ms> Base silent warmup after DSD open, scaled by DSD\n");
-  fprintf(stderr, "                               multiplier at runtime (default 50, range 0..2000).\n");
   fprintf(stderr, "\n");
   fprintf(stderr, "Diretta SDK advanced knobs:\n");
   fprintf(stderr, "  --thread-mode <mode>         SDK thread mode bitmask (default: 1=CRITICAL).\n");
@@ -171,9 +169,10 @@ static void show_usage(const char *arg0)
   fprintf(stderr, "  --stats                      Force stats printing even without --verbose.\n");
   fprintf(stderr, "\n");
   fprintf(stderr, "Logging:\n");
-  fprintf(stderr, "  --verbose, -v                Verbose debug output (Diretta SDK log level: DEBUG).\n");
-  fprintf(stderr, "  --quiet,   -q                Quiet -- only errors and warnings (log level: WARN).\n");
-  fprintf(stderr, "  --diretta-debug              Advanced SDK phase trace; default off.\n");
+  fprintf(stderr, "  --verbose, -v                Verbose s2d output (format, open, stats). Repeat for -vv.\n");
+  fprintf(stderr, "  --quiet,   -q                Quiet -- only errors and warnings.\n");
+  fprintf(stderr, "  --diretta-debug              SDK phase trace plus Host SDK syslog on stderr\n");
+  fprintf(stderr, "                               ([sdk] info rcv / FEEDBACK every InfoCycle; default off).\n");
   fprintf(stderr, "  --help,    -h                Show this help and exit.\n");
   fprintf(stderr, "  --version                   Show version and exit.\n");
   fprintf(stderr, "\n");
@@ -252,20 +251,13 @@ enum {
   OPT_TRANSFER_MODE,
   OPT_TARGET_PROFILE_LIMIT,
   OPT_MTU,
-  OPT_RING_BUFFER_MS,
-  OPT_PREFILL_MS,
   OPT_REBUFFER_PERCENT,
-  OPT_STARTUP_QUEUE_MS,
-  OPT_STARTUP_MUTE_MS,
   OPT_STATS_INTERVAL,
   OPT_STATS,
   OPT_DIRETTA_DEBUG,
   OPT_FORMAT_CHANGE_COOLDOWN_MS,
   OPT_UPSTREAM_IDLE_TIMEOUT_SEC,
   OPT_UPSTREAM_PAUSE_TIMEOUT_SEC,
-  OPT_UNDERRUN_REBUFFER_PERCENT,
-  OPT_UNDERRUN_REBUFFER_MS,
-  OPT_STARTUP_REAL_DELAY_MS,
   OPT_DUMP_INGRESS_WAV,
   OPT_DUMP_EGRESS_WAV,
   OPT_DUMP_MS,
@@ -283,7 +275,6 @@ enum {
   OPT_PCM_PREFILL_MS,
   OPT_DSD_BUFFER_MS,
   OPT_DSD_PREFILL_MS,
-  OPT_DSD_STARTUP_WARMUP_MS,
   OPT_UDP_RCVBUF_BYTES,
   OPT_UDP_BUSY_POLL_US,
   OPT_ENABLE_NIC_TIMESTAMP,
@@ -310,20 +301,13 @@ static const struct option long_options[] = {
   { "transfer-mode",        required_argument, 0, OPT_TRANSFER_MODE },
   { "target-profile-limit", required_argument, 0, OPT_TARGET_PROFILE_LIMIT },
   { "mtu",                  required_argument, 0, OPT_MTU },
-  { "ring-buffer-ms",       required_argument, 0, OPT_RING_BUFFER_MS },
-  { "prefill-ms",           required_argument, 0, OPT_PREFILL_MS },
   { "rebuffer-percent",     required_argument, 0, OPT_REBUFFER_PERCENT },
-  { "startup-queue-ms",     required_argument, 0, OPT_STARTUP_QUEUE_MS },
-  { "startup-mute-ms",      required_argument, 0, OPT_STARTUP_MUTE_MS },
   { "stats-interval",       required_argument, 0, OPT_STATS_INTERVAL },
   { "stats",                no_argument,       0, OPT_STATS },
   { "diretta-debug",        no_argument,       0, OPT_DIRETTA_DEBUG },
   { "format-change-cooldown-ms", required_argument, 0, OPT_FORMAT_CHANGE_COOLDOWN_MS },
   { "upstream-idle-timeout-sec", required_argument, 0, OPT_UPSTREAM_IDLE_TIMEOUT_SEC },
   { "upstream-pause-timeout-sec", required_argument, 0, OPT_UPSTREAM_PAUSE_TIMEOUT_SEC },
-  { "underrun-rebuffer-percent", required_argument, 0, OPT_UNDERRUN_REBUFFER_PERCENT },
-  { "underrun-rebuffer-ms",      required_argument, 0, OPT_UNDERRUN_REBUFFER_MS },
-  { "startup-real-delay-ms",     required_argument, 0, OPT_STARTUP_REAL_DELAY_MS },
   { "dump-ingress-wav",          required_argument, 0, OPT_DUMP_INGRESS_WAV },
   { "dump-egress-wav",           required_argument, 0, OPT_DUMP_EGRESS_WAV },
   { "dump-ms",                   required_argument, 0, OPT_DUMP_MS },
@@ -341,7 +325,6 @@ static const struct option long_options[] = {
   { "pcm-prefill-ms",            required_argument, 0, OPT_PCM_PREFILL_MS },
   { "dsd-buffer-ms",             required_argument, 0, OPT_DSD_BUFFER_MS },
   { "dsd-prefill-ms",            required_argument, 0, OPT_DSD_PREFILL_MS },
-  { "dsd-startup-warmup-ms",     required_argument, 0, OPT_DSD_STARTUP_WARMUP_MS },
   { "udp-rcvbuf-bytes",          required_argument, 0, OPT_UDP_RCVBUF_BYTES },
   { "udp-busy-poll-us",          required_argument, 0, OPT_UDP_BUSY_POLL_US },
   { "enable-nic-timestamp",      no_argument,       0, OPT_ENABLE_NIC_TIMESTAMP },
@@ -527,29 +510,12 @@ int main(int argc, char*argv[]) {
       dcfg.mtu_override = atoi(optarg);
       if (dcfg.mtu_override < 0) show_usage(argv[0]);
       break;
-    case OPT_RING_BUFFER_MS:
-      /* Compatibility alias for --pcm-buffer-ms. */
-      dcfg.ring_buffer_ms = atoi(optarg);
-      if (dcfg.ring_buffer_ms < 50 || dcfg.ring_buffer_ms > 5000) {
-        fprintf(stderr, "--ring-buffer-ms must be 50..5000\n");
-        return 1;
-      }
-      fprintf(stderr, "[scream2diretta] NOTE: --ring-buffer-ms is a compatibility alias; "
-              "use --pcm-buffer-ms instead.\n");
-      break;
     case OPT_PCM_BUFFER_MS:
       dcfg.ring_buffer_ms = atoi(optarg);
       if (dcfg.ring_buffer_ms < 50 || dcfg.ring_buffer_ms > 5000) {
         fprintf(stderr, "--pcm-buffer-ms must be 50..5000\n");
         return 1;
       }
-      break;
-    case OPT_PREFILL_MS:
-      /* Compatibility alias for --pcm-prefill-ms. */
-      dcfg.prefill_ms = atoi(optarg);
-      if (dcfg.prefill_ms < 0) show_usage(argv[0]);
-      fprintf(stderr, "[scream2diretta] NOTE: --prefill-ms is a compatibility alias; "
-              "use --pcm-prefill-ms instead.\n");
       break;
     case OPT_PCM_PREFILL_MS: {
       int v = atoi(optarg);
@@ -576,15 +542,6 @@ int main(int argc, char*argv[]) {
         return 1;
       }
       dcfg.dsd_prefill_ms = v;
-      break;
-    }
-    case OPT_DSD_STARTUP_WARMUP_MS: {
-      int v = atoi(optarg);
-      if (v < 0 || v > 2000) {
-        fprintf(stderr, "--dsd-startup-warmup-ms must be 0..2000\n");
-        return 1;
-      }
-      dcfg.dsd_startup_warmup_ms = v;
       break;
     }
     case OPT_UDP_RCVBUF_BYTES: {
@@ -678,24 +635,6 @@ int main(int argc, char*argv[]) {
       dcfg.rebuffer_percent = (float)(pct / 100.0);
       break;
     }
-    case OPT_STARTUP_QUEUE_MS: {
-      int v = atoi(optarg);
-      if (v < 0 || v > 5000) {
-        fprintf(stderr, "--startup-queue-ms must be 0..5000\n");
-        return 1;
-      }
-      dcfg.startup_queue_ms = v;
-      break;
-    }
-    case OPT_STARTUP_MUTE_MS: {
-      int v = atoi(optarg);
-      if (v < 0 || v > 2000) {
-        fprintf(stderr, "--startup-mute-ms must be 0..2000\n");
-        return 1;
-      }
-      dcfg.startup_mute_ms = v;
-      break;
-    }
     case OPT_STATS_INTERVAL: {
       int s = atoi(optarg);
       if (s < 0 || s > 86400) {
@@ -736,33 +675,6 @@ int main(int argc, char*argv[]) {
         return 1;
       }
       dcfg.upstream_pause_timeout_sec = v;
-      break;
-    }
-    case OPT_UNDERRUN_REBUFFER_PERCENT: {
-      double pct = atof(optarg);
-      if (pct < 0.0 || pct > 95.0) {
-        fprintf(stderr, "--underrun-rebuffer-percent must be 0..95\n");
-        return 1;
-      }
-      dcfg.rebuffer_percent = (float)(pct / 100.0);
-      break;
-    }
-    case OPT_UNDERRUN_REBUFFER_MS: {
-      int v = atoi(optarg);
-      if (v < 0 || v > 5000) {
-        fprintf(stderr, "--underrun-rebuffer-ms must be 0..5000 (0 = use --rebuffer-percent)\n");
-        return 1;
-      }
-      dcfg.underrun_rebuffer_ms = v;
-      break;
-    }
-    case OPT_STARTUP_REAL_DELAY_MS: {
-      int v = atoi(optarg);
-      if (v < 0 || v > 5000) {
-        fprintf(stderr, "--startup-real-delay-ms must be 0..5000 (0 = disabled)\n");
-        return 1;
-      }
-      dcfg.startup_real_delay_ms = v;
       break;
     }
     case OPT_DUMP_INGRESS_WAV:
@@ -866,20 +778,13 @@ int main(int argc, char*argv[]) {
     case OPT_TRANSFER_MODE:
     case OPT_TARGET_PROFILE_LIMIT:
     case OPT_MTU:
-    case OPT_RING_BUFFER_MS:
-    case OPT_PREFILL_MS:
     case OPT_REBUFFER_PERCENT:
-    case OPT_STARTUP_QUEUE_MS:
-    case OPT_STARTUP_MUTE_MS:
     case OPT_STATS_INTERVAL:
     case OPT_STATS:
     case OPT_DIRETTA_DEBUG:
     case OPT_FORMAT_CHANGE_COOLDOWN_MS:
     case OPT_UPSTREAM_IDLE_TIMEOUT_SEC:
     case OPT_UPSTREAM_PAUSE_TIMEOUT_SEC:
-    case OPT_UNDERRUN_REBUFFER_PERCENT:
-    case OPT_UNDERRUN_REBUFFER_MS:
-    case OPT_STARTUP_REAL_DELAY_MS:
     case OPT_DUMP_INGRESS_WAV:
     case OPT_DUMP_EGRESS_WAV:
     case OPT_DUMP_MS:
@@ -907,9 +812,9 @@ int main(int argc, char*argv[]) {
   }
 
 #if DIRETTA_ENABLE
-  // Map verbosity / quiet to Diretta SDK log level.
+  // Host SDK SysLog Debug (info rcv / FEEDBACK, formerly UDP 19640) is
+  // --diretta-debug only. -v/-vv only raise s2d's own DLOG / phase lines.
   if (quiet) dcfg.log_level = DIRETTA_LOG_WARN;
-  else if (verbosity > 0) dcfg.log_level = DIRETTA_LOG_DEBUG;
   else dcfg.log_level = DIRETTA_LOG_DEFAULT;
 
   if (do_list_targets) {

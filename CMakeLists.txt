@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.7...4.0)
 
-project(scream2diretta VERSION 0.7 LANGUAGES C CXX)
+project(scream2diretta VERSION 0.8 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -50,10 +50,10 @@ set(SCREAM2DIRETTA_SOURCES
 #
 # Example:
 #   cmake -DDIRETTA_ENABLE=ON \
-#         -DDIRETTA_SDK_ROOT=/path/to/DirettaHostSDK_149 \
+#         -DDIRETTA_SDK_ROOT=/path/to/DirettaHostSDK_150 \
 #         -DDIRETTA_ARCH_SUFFIX=x64-linux-15v3 ..
 option(DIRETTA_ENABLE "Enable Diretta output" OFF)
-set(DIRETTA_SDK_ROOT "" CACHE PATH "Path to extracted DirettaHostSDK_149 (must contain Host/ and lib/)")
+set(DIRETTA_SDK_ROOT "" CACHE PATH "Path to extracted DirettaHostSDK_150 (must contain Host/ and lib/)")
 set(DIRETTA_ARCH_SUFFIX "x64-linux-15v3" CACHE STRING "Diretta arch suffix used for libACQUA_<suffix>.a / libDirettaHost_<suffix>.a")
 option(DIRETTA_NOLOG "Link the -nolog SDK variants" OFF)
 
@@ -61,7 +61,7 @@ if (DIRETTA_ENABLE)
   if (NOT DIRETTA_SDK_ROOT OR NOT EXISTS "${DIRETTA_SDK_ROOT}/Host" OR NOT EXISTS "${DIRETTA_SDK_ROOT}/lib")
     message(FATAL_ERROR
       "DIRETTA_ENABLE=ON requires DIRETTA_SDK_ROOT to point at a directory "
-      "containing Host/ and lib/ (the extracted DirettaHostSDK_149).")
+      "containing Host/ and lib/ (the extracted DirettaHostSDK_150).")
   endif ()
   if (DIRETTA_NOLOG)
     set(_diretta_suffix "${DIRETTA_ARCH_SUFFIX}-nolog")

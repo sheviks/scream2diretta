@@ -227,9 +227,6 @@ struct DirettaState {
     // -vv: throttle "prefill gate" progress prints during priming.
     long long last_prefill_log_ms = 0;
     bool prefill_logged_open = false;
-    // Track mute-gate completion so we log the transition exactly once per
-    // Sync open and can correlate it with the prefill gate opening.
-    bool mute_logged_complete = false;
 
     // Diretta debug phase tracing.
     // Anchor for relative timestamps. Reset on each format-change accepted;
@@ -325,16 +322,6 @@ struct DirettaState {
     uint64_t last_stats_ring_fill_bytes = 0;
     bool     have_last_stats_snapshot = false;
 
-    // startup_real_delay observer flags. The Sync owns the gate state;
-    // the receive thread observes the transition real_delay_done from
-    // false -> true so it can emit a single startup_real_delay_end phase
-    // event with queue-fill before/after diagnostics.
-    bool phase_logged_startup_real_delay_begin = false;
-    bool phase_logged_startup_real_delay_end = false;
-    uint64_t startup_real_delay_queue_fill_at_begin = 0;
-    uint64_t startup_real_delay_pushed_at_begin = 0;
-    uint64_t startup_real_delay_popped_at_begin = 0;
-
     // PCM dumpers. Configured once at diretta_output_init from the
     // CLI prefixes. ingress_dumper is written from the receive thread
     // immediately before queue_push_frames; egress_dumper is attached to
@@ -411,6 +398,19 @@ extern "C" int g_diretta_diag_armed_flag = 0;
     } \
 } while (0)
 
+// SDK 150 is_MSmode() returns the live negotiated MSmodeSet once online.
+// The SDK maps AUTO → NONE (still negotiating, or no multi-stream).
+static const char* msmode_name(Sync::MSMODE m) {
+    switch (m) {
+        case Sync::MSMODE_NONE: return "NONE";
+        case Sync::MSMODE_MS1:  return "MS1";
+        case Sync::MSMODE_MS2:  return "MS2";
+        case Sync::MSMODE_MS3:  return "MS3";
+        case Sync::MSMODE_AUTO: return "AUTO";
+        default:                return "unknown";
+    }
+}
+
 // Phase-trace helpers.
 //
 // Independent of -v / -vv: when --diretta-debug is set, every event below
@@ -451,11 +451,6 @@ static void dbg_reset_open_flags() {
     g_st.dbg_logged_first_packet_after_open_begin = false;
     g_st.dbg_logged_first_push_during_open_grace = false;
     g_st.phase_logged_open_grace_nonblocking = false;
-    g_st.phase_logged_startup_real_delay_begin = false;
-    g_st.phase_logged_startup_real_delay_end = false;
-    g_st.startup_real_delay_queue_fill_at_begin = 0;
-    g_st.startup_real_delay_pushed_at_begin = 0;
-    g_st.startup_real_delay_popped_at_begin = 0;
     // A fresh Sync open resets the per-Sync underrun counters, so the
     // observer state must reset too. Otherwise the first underrun on the
     // new Sync would be missed (cur_events would already equal the stale
@@ -775,18 +770,43 @@ static SysLog::SysLogLevel map_log_level(diretta_log_level_t l) {
     }
 }
 
+// Host SDK SysLog independent-output callback (ACQUA::SysLog::StdErrOut).
+// systemd StandardOutput=append is not a TTY, so libc fully-buffers stdout
+// and DRUP's "direct to stdout" path never shows up in tail -f. stderr is
+// the same stream s2d already uses (and the unit appends both).
+static void sdk_syslog_emit(const char* msg) {
+    if (!msg || msg[0] == '\0') return;
+    std::fputs("[sdk] ", stderr);
+    std::fputs(msg, stderr);
+    const size_t n = std::strlen(msg);
+    if (n == 0 || msg[n - 1] != '\n')
+        std::fputc('\n', stderr);
+}
+
 static void init_syslog(const diretta_config_t& cfg) {
     static bool done = false;
     if (done) return;
-    SysLog::initialize(SysLog::local0, /*port*/ 0, /*stdout*/ true);
-    // --diretta-debug forces the SDK's own SysLog level to Debug so the
-    // underlying library's "log" archives (libDirettaHost / libACQUA, the
-    // non-"-nolog" variants) emit their full event stream. With the -nolog
-    // archives this is a no-op, but it costs nothing to set.
-    const SysLog::SysLogLevel lvl = cfg.diretta_debug
-                                    ? SysLog::Debug
-                                    : map_log_level(cfg.log_level);
-    SysLogDiretta::changeLevel(lvl, DIRETTA::SyslogPortHost);
+    if (cfg.diretta_debug) {
+        // SysLogDiretta::initialize alone (DRUP DIRETTA_SDK_SYSLOG_DEBUG)
+        // still left Host SDK lines invisible under systemd file redirect.
+        // Attach ACQUA's StdErrOut callback last so every SDK line is
+        // written to stderr with an [sdk] prefix. port=0: no logcatch UDP.
+        // No-op when linked against a -nolog archive.
+        (void)SysLogDiretta::initialize(SysLog::user, /*port*/ 0, /*st*/ false);
+        const bool cb_ok = SysLog::initialize(SysLog::user, sdk_syslog_emit);
+        SysLogDiretta::changeLevel(SysLog::Debug, /*port*/ 0);
+        std::fprintf(stderr,
+            "[diretta-debug] Host SDK SysLog attached to stderr via callback "
+            "(%s); level=Debug. Expect [sdk] info rcv / FEEDBACK every "
+            "InfoCycle (~100 ms).\n",
+            cb_ok ? "ok" : "fail");
+        SysLog::Debug << "s2d syslog probe";
+    } else {
+        // Notice/Warning only; no Debug, no logcatch UDP. -v/-vv must not
+        // leak Host SDK FEEDBACK onto 19640.
+        SysLog::initialize(SysLog::local0, /*erout*/ false, /*port*/ 0);
+        SysLogDiretta::changeLevel(map_log_level(cfg.log_level), /*port*/ 0);
+    }
     done = true;
 }
 
@@ -1172,10 +1192,9 @@ static void configure_unified_queue(uint32_t sample_rate,
 
     // Pre-compute the open-gate threshold in bytes for this format.
     // The Sync open is deferred until queue fill >= this value (or the
-    // OPEN_GATE_MAX_WAIT_MS fallback fires). The threshold mirrors the
-    // Sync's own prefill gate: max(prefill_ms, startup_queue_ms).
-    int startup_ms  = g_st.cfg.startup_queue_ms > 0 ? g_st.cfg.startup_queue_ms : 0;
-    int gate_ms = (startup_ms > prefill_ms) ? startup_ms : prefill_ms;
+    // OPEN_GATE_MAX_WAIT_MS fallback fires). Same threshold as the
+    // Sync's own prefill gate.
+    int gate_ms = prefill_ms;
     if (gate_ms > ring_ms) gate_ms = ring_ms / 2;
     if (gate_ms < 0) gate_ms = 0;
     size_t thr = static_cast<size_t>((bps * static_cast<uint64_t>(gate_ms)) / 1000);
@@ -1590,17 +1609,15 @@ static uint32_t open_sync_worker_blocking(scream_diretta::ScreamDirettaSync*& ou
     dbg_event("sdk_sync_open_return", "result=ok");
 
     const uint32_t mtu_eff = cfg.mtu_override > 0 ? (uint32_t)cfg.mtu_override : g_st.mtu;
-    const int eff_buf_ms = cfg.target_buffer_ms;
     phase_event("setSink_begin",
-                "addr=%s buffer_ms=%d mtu=%u",
-                ip_to_str(g_st.sink_addr).c_str(), eff_buf_ms, (unsigned)mtu_eff);
+                "addr=%s buffer_ms=0 mtu=%u",
+                ip_to_str(g_st.sink_addr).c_str(), (unsigned)mtu_eff);
     dbg_event("setSink_begin",
-              "addr=%s buffer_ms=%d mtu=%u nopBreak=false",
+              "addr=%s buffer_ms=0 mtu=%u nopBreak=false",
               ip_to_str(g_st.sink_addr).c_str(),
-              eff_buf_ms,
               (unsigned)mtu_eff);
     if (!sync->setSink(g_st.sink_addr,
-                       Clock::MilliSeconds(eff_buf_ms),
+                       Clock(),  // 0 = SDK / Target default sink buffer time
                        /*nopBreak*/ false,
                        mtu_eff)) {
         DLOG(0, "setSink() failed");
@@ -1610,7 +1627,7 @@ static uint32_t open_sync_worker_blocking(scream_diretta::ScreamDirettaSync*& ou
         delete sync;
         return 0;
     }
-    phase_event("setSink_end", "result=ok buffer_ms=%d", eff_buf_ms);
+    phase_event("setSink_end", "result=ok buffer_ms=0");
     dbg_event("setSink_return", "result=ok");
     // Pace the handshake: target needs time between SDK calls or it
     // misses the first cycles and produces no audio. Mirrors DRUP /
@@ -1742,20 +1759,20 @@ static uint32_t open_sync_worker_blocking(scream_diretta::ScreamDirettaSync*& ou
                       (unsigned)si.supportMSmode);
         }
         if (verbosity >= 2) {
+            // supportMSmode is a Target capability bitmask (bit0=MS1, bit1=MS2,
+            // bit2=MS3), not the live connection mode. The negotiated mode is
+            // logged from is_MSmode() after connectWait / online poll.
             const uint16_t msm = si.supportMSmode;
-            const char* inferred_ms = "NONE";
-            if (msm & 0x04)       inferred_ms = "MS3";
-            else if (msm & 0x01)  inferred_ms = "MS1";
-            DLOG(2, "sink caps: pcm=0x%x dsd_lsb=%s dsd_msb=%s ms_mode=%s "
-                 "(supported:%s%s%s) latency_buf=%uus latency_max=%uus latency_hw=%uus "
-                 "max_mtu=%u max_payload=%u%s inferred_overhead=%s",
+            DLOG(2, "sink caps: pcm=0x%x dsd_lsb=%s dsd_msb=%s "
+                 "ms_supported:%s%s%s (0x%x) latency_buf=%uus latency_max=%uus "
+                 "latency_hw=%uus max_mtu=%u max_payload=%u%s inferred_overhead=%s",
                  (unsigned)si.supportPCM,
                  si.checkSinkSupportDSDlsb() ? "yes" : "no",
                  si.checkSinkSupportDSDmsb() ? "yes" : "no",
-                 inferred_ms,
                  (msm & 0x01) ? " MS1" : "",
                  (msm & 0x02) ? " MS2" : "",
                  (msm & 0x04) ? " MS3" : "",
+                 (unsigned)msm,
                  (unsigned)si.latencyBuffer * 100u,
                  (unsigned)si.latencyMax * 100u,
                  (unsigned)si.latencyHw * 100u,
@@ -1872,40 +1889,24 @@ static uint32_t open_sync_worker_blocking(scream_diretta::ScreamDirettaSync*& ou
     scream_diretta::SyncTuning tuning;
     int ring_ms  = cfg.ring_buffer_ms > 0 ? cfg.ring_buffer_ms : 1000;
     int prefill_ms = cfg.prefill_ms     > 0 ? cfg.prefill_ms     : 500;
-    int mute_ms  = cfg.startup_mute_ms  > 0 ? cfg.startup_mute_ms  : 0;
-    int real_delay_ms = cfg.startup_real_delay_ms > 0 ? cfg.startup_real_delay_ms : 0;
     if (is_dsd) {
         ring_ms    = cfg.dsd_buffer_ms  > 0 ? cfg.dsd_buffer_ms  : DSD_BUFFER_MS_DEFAULT;
         prefill_ms = cfg.dsd_prefill_ms > 0 ? cfg.dsd_prefill_ms : DSD_PREFILL_MS_DEFAULT;
-        const uint32_t mult = dsd_multiplier > 1 ? dsd_multiplier : 1;
-        mute_ms       = static_cast<int>(mute_ms * mult);
-        real_delay_ms = static_cast<int>(real_delay_ms * mult);
-        const int dsd_warmup = cfg.dsd_startup_warmup_ms > 0 ? cfg.dsd_startup_warmup_ms : 0;
-        mute_ms += static_cast<int>(dsd_warmup * mult);
-        if (mute_ms > 2000) mute_ms = 2000;
-        if (real_delay_ms > 5000) real_delay_ms = 5000;
     }
     tuning.ring_buffer_ms = ring_ms;
     tuning.prefill_ms     = prefill_ms;
     tuning.rebuffer_percent = (cfg.rebuffer_percent >= 0.0f && cfg.rebuffer_percent <= 0.95f)
                               ? cfg.rebuffer_percent : 0.50f;
-    tuning.underrun_rebuffer_ms = cfg.underrun_rebuffer_ms > 0 ? cfg.underrun_rebuffer_ms : 0;
-    tuning.startup_queue_ms = cfg.startup_queue_ms > 0 ? cfg.startup_queue_ms : 0;
-    tuning.startup_mute_ms  = mute_ms;
-    tuning.startup_real_delay_ms = real_delay_ms;
     {
         uint32_t bps = bits_per_sample / 8;
         if (bps == 0) bps = 1;
         sync->configureFormat(sample_rate, channels, bps, tuning);
     }
     dbg_event("configureFormat_done",
-              "ring_ms=%d prefill_ms=%d startup_queue_ms=%d startup_mute_ms=%d "
-              "startup_real_delay_ms=%d rebuffer_pct=%.0f underrun_rebuffer_ms=%d "
+              "ring_ms=%d prefill_ms=%d rebuffer_pct=%.0f "
               "sample_rate=%u channels=%u bps=%u",
-              tuning.ring_buffer_ms, tuning.prefill_ms, tuning.startup_queue_ms,
-              tuning.startup_mute_ms, tuning.startup_real_delay_ms,
+              tuning.ring_buffer_ms, tuning.prefill_ms,
               tuning.rebuffer_percent * 100.0f,
-              tuning.underrun_rebuffer_ms,
               sample_rate, channels, bits_per_sample / 8);
 
     const int connect_cpu = cfg.cpu_audio >= 0 ? cfg.cpu_audio : 0;
@@ -1959,6 +1960,15 @@ static uint32_t open_sync_worker_blocking(scream_diretta::ScreamDirettaSync*& ou
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
         dbg_event("online_poll_done", "is_online=%d", sync->is_online() ? 1 : 0);
+
+        // SDK 150: live negotiated multi-stream mode (MSmodeSet). Valid only
+        // when is_online(); AUTO (still settling) is reported as NONE.
+        const Sync::MSMODE ms = sync->is_MSmode();
+        DLOG(1, "MS mode: %s (requested AUTO, is_online=%d)",
+             msmode_name(ms), sync->is_online() ? 1 : 0);
+        dbg_event("ms_mode",
+                  "negotiated=%s raw=%d is_online=%d",
+                  msmode_name(ms), (int)ms, sync->is_online() ? 1 : 0);
     }
 
     phase_event("play_begin", "");
@@ -2057,41 +2067,22 @@ static void finalize_sync_open_on_receiver(scream_diretta::ScreamDirettaSync* sy
     g_st.reconnect_pending = false;
     g_st.prefill_logged_open = false;
     g_st.last_prefill_log_ms = 0;
-    g_st.mute_logged_complete = (cfg.startup_mute_ms <= 0);
 
     int eff_prefill_ms = cfg.prefill_ms > 0 ? cfg.prefill_ms : 500;
-    int eff_startup_mute_ms = cfg.startup_mute_ms > 0 ? cfg.startup_mute_ms : 0;
     if (g_st.is_dsd) {
         eff_prefill_ms = cfg.dsd_prefill_ms > 0 ? cfg.dsd_prefill_ms : DSD_PREFILL_MS_DEFAULT;
-        const uint32_t mult = g_st.dsd_multiplier > 1 ? g_st.dsd_multiplier : 1;
-        eff_startup_mute_ms = static_cast<int>(eff_startup_mute_ms * mult);
-        const int dsd_warmup = cfg.dsd_startup_warmup_ms > 0 ? cfg.dsd_startup_warmup_ms : 0;
-        eff_startup_mute_ms += static_cast<int>(dsd_warmup * mult);
-        if (eff_startup_mute_ms > 2000) eff_startup_mute_ms = 2000;
     }
-    const int eff_startup_queue_ms = cfg.startup_queue_ms > 0 ? cfg.startup_queue_ms : 0;
     const float eff_rebuffer_pct   = (cfg.rebuffer_percent >= 0.0f && cfg.rebuffer_percent <= 0.95f)
                                      ? cfg.rebuffer_percent : 0.50f;
-    const int gate_ms = (eff_startup_queue_ms > 0 && eff_startup_queue_ms > eff_prefill_ms)
-                         ? eff_startup_queue_ms
-                         : eff_prefill_ms;
     DLOG(1, "sync open finalised on receive thread: queue=%zu/%zu B (~%llu ms), "
-         "prefill_ms=%d, startup_queue_ms=%d, startup_mute_ms=%d, rebuffer=%.0f%%, "
-         "gate_threshold=%d ms (format=%u Hz, %u-bit, %u ch). "
+         "prefill_ms=%d, rebuffer=%.0f%%, gate_threshold=%d ms "
+         "(format=%u Hz, %u-bit, %u ch). "
          "SDK pulls real PCM from cycle 1. open_grace is diagnostic-only and "
          "did NOT block the receive path during this open.",
          g_st.sync->ringFill(), g_st.sync->ringBytes(),
          (unsigned long long)g_st.sync->ringFillMs(),
-         eff_prefill_ms, eff_startup_queue_ms, eff_startup_mute_ms,
-         eff_rebuffer_pct * 100.0f, gate_ms,
+         eff_prefill_ms, eff_rebuffer_pct * 100.0f, eff_prefill_ms,
          g_st.sample_rate, g_st.bits_per_sample, g_st.channels);
-    if (eff_startup_mute_ms > 0 && verbosity >= 2) {
-        DLOG(2, "startup mute: outputting silence for ~%d ms of "
-             "real pull cycles before popping PCM. Not recommended with the current open gate — "
-             "queue prebuffer at open=%llu ms",
-             eff_startup_mute_ms,
-             (unsigned long long)g_st.sync->ringFillMs());
-    }
     phase_event("sync_open_end",
                 "queue_fill=%zu/%zu B (~%llu ms) is_connect=%d stream_count=%llu",
                 g_st.sync->ringFill(), g_st.sync->ringBytes(),
@@ -2151,24 +2142,22 @@ static bool start_async_sync_open(const FormatConfigure& fc, const char* reason)
          ip_to_str(g_st.sink_addr).c_str(),
          g_st.async_open_reason.c_str());
     phase_event("sync_open_begin",
-                "target=%s mtu=%u target_buffer_ms=%d cycle_us=%d "
+                "target=%s mtu=%u cycle_us=%d "
                 "info_cycle_us=%d transfer_mode=%d format=%uHz %u-bit %uch "
                 "queue_fill=%zu/%zu B nonblocking=1 reason=%s",
                 ip_to_str(g_st.sink_addr).c_str(),
                 (unsigned)(cfg.mtu_override > 0 ? (uint32_t)cfg.mtu_override : g_st.mtu),
-                cfg.target_buffer_ms,
                 cfg.cycle_us, cfg.info_cycle_us, (int)cfg.transfer_mode,
                 g_st.sample_rate, g_st.bits_per_sample, g_st.channels,
                 g_st.queue_ready ? g_st.queue.available() : 0,
                 g_st.queue_ready ? g_st.queue.capacity() : 0,
                 g_st.async_open_reason.c_str());
     dbg_event("sync_open_begin",
-              "target=%s mtu=%u target_buffer_ms=%d thread_mode=0x%x cycle_us=%d "
+              "target=%s mtu=%u thread_mode=0x%x cycle_us=%d "
               "info_cycle_us=%d transfer_mode=%d target_profile_limit_us=%d "
               "format=%uHz %u-bit %uch (bpf=%u) queue_fill=%zu/%zu B nonblocking=1",
               ip_to_str(g_st.sink_addr).c_str(),
               (unsigned)(cfg.mtu_override > 0 ? (uint32_t)cfg.mtu_override : g_st.mtu),
-              cfg.target_buffer_ms,
               (unsigned)(cfg.thread_mode != 0 ? cfg.thread_mode : (unsigned)Sync::CRITICAL),
               cfg.cycle_us, cfg.info_cycle_us,
               (int)cfg.transfer_mode, cfg.target_profile_limit_us,
@@ -2534,11 +2523,10 @@ static bool reconfigure(const receiver_format_t& rf) {
         ? (g_st.cfg.dsd_prefill_ms > 0 ? g_st.cfg.dsd_prefill_ms : DSD_PREFILL_MS_DEFAULT)
         : (g_st.cfg.prefill_ms > 0 ? g_st.cfg.prefill_ms : 500);
     DLOG(1, "queue sizing: rate=%u ch=%u bytes_per_sample=%u bytes_per_frame=%u "
-         "ring_ms=%d prefill_ms=%d startup_queue_ms=%d",
+         "ring_ms=%d prefill_ms=%d",
          rate, ch, bits / 8, bpf,
          active_ring_ms,
-         active_prefill_ms,
-         g_st.cfg.startup_queue_ms);
+         active_prefill_ms);
     DLOG(1, "open sequencing: cooldown=%d ms (first_open=%d), then wait for queue fill "
          ">= %zu B before opening Sync (fallback open after %d ms more)",
          cooldown_ms, is_first_open ? 1 : 0,
@@ -2880,18 +2868,6 @@ static void maybe_log_prefill_progress() {
     if (verbosity < 2 || !g_st.sync) return;
     auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
-    // Log the mute-gate completion exactly once. After it completes,
-    // the prefill gate is allowed to open (it will the next time the SDK
-    // observes ring fill >= threshold).
-    if (!g_st.mute_logged_complete && g_st.sync->muteDone()) {
-        g_st.mute_logged_complete = true;
-        DLOG(2, "startup mute complete; real PCM gate may open once "
-             "fill >= %zu B (current fill=%zu B / %llu ms, "
-             "silent cycles so far=%llu)",
-             g_st.sync->prefillBytes(), g_st.sync->ringFill(),
-             (unsigned long long)g_st.sync->ringFillMs(),
-             (unsigned long long)g_st.sync->silentCycles());
-    }
     const bool gate_open = g_st.sync->prefillDone();
     if (gate_open) {
         if (!g_st.prefill_logged_open) {
@@ -2962,7 +2938,6 @@ extern "C" void diretta_config_init(diretta_config_t *cfg) {
     if (!cfg) return;
     std::memset(cfg, 0, sizeof(*cfg));
     cfg->target_index = 0;
-    cfg->target_buffer_ms = 0;  // 0 = let SDK use default sink buffer time
     cfg->thread_mode = 1u; // CRITICAL
     cfg->cycle_us = 0;
     cfg->cycle_min_us = 0;
@@ -2973,26 +2948,6 @@ extern "C" void diretta_config_init(diretta_config_t *cfg) {
     cfg->ring_buffer_ms = 1000;
     cfg->prefill_ms = 500;
     cfg->rebuffer_percent = 0.50f;
-    // 0 = fall back to rebuffer_percent.
-    // User can opt in to a smaller, faster recovery with
-    // --underrun-rebuffer-ms 100..200.
-    cfg->underrun_rebuffer_ms = 0;
-    // startup_queue_ms defaults to 0. The format-specific prefill controls
-    // the open-fill gate by default; --startup-queue-ms is an explicit
-    // advanced override that can require a deeper queue at fresh Sync open
-    // without changing the PCM/DSD prefill defaults.
-    cfg->startup_queue_ms = 0;
-    // startup_mute_ms is a compatibility diagnostic and DEFAULT OFF.
-    // The current open gate avoids muting real PCM after Sync open.
-    // the click by delaying the open itself. The CLI flag is still
-    // parsed for back-compat but is not recommended.
-    cfg->startup_mute_ms = 0;
-    // Post-play "real delay" silent window (ms). Default 0 = disabled
-    // Unlike --startup-mute-ms, the
-    // unified queue is NOT consumed during this window, so the head of the
-    // track is preserved. Diagnostic option to absorb target/DAC
-    // stabilization artifacts into silence after play.
-    cfg->startup_real_delay_ms = 0;
     // Default format-change cooldown.
     // 200 ms has proven sufficient for tested Diretta targets while keeping
     // DSD256/DSD512 format-change accumulation within the DSD ring budget.
@@ -3005,7 +2960,6 @@ extern "C" void diretta_config_init(diretta_config_t *cfg) {
     // DSD defaults aligned with DRUP / slim2Diretta conventions.
     cfg->dsd_buffer_ms = DSD_BUFFER_MS_DEFAULT;
     cfg->dsd_prefill_ms = DSD_PREFILL_MS_DEFAULT;
-    cfg->dsd_startup_warmup_ms = 50;
     // CPU affinity: -1 = disabled (default). Applied when >= 0.
     cfg->cpu_scream = -1;
     cfg->cpu_audio  = -1;
@@ -3144,9 +3098,10 @@ extern "C" int diretta_output_init(const diretta_config_t *cfg) {
         // Announce the debug subsystem up front. SDK debug output still
         // depends on whether a -nolog SDK archive was linked.
         std::fprintf(stderr,
-            "[diretta-debug] enabled; sdk_debug=yes; phase_trace=yes; "
-            "anchor=format_change_accepted (and sync_open_begin); "
-            "events on stderr with [diretta-debug] prefix\n");
+            "[diretta-debug] enabled; sdk_debug=yes; sdk_syslog=stdout; "
+            "phase_trace=yes; anchor=format_change_accepted "
+            "(and sync_open_begin); events on stderr with [diretta-debug] "
+            "prefix; Host SDK SysLog (info rcv / FEEDBACK) on stdout\n");
     }
 
     Find::Setting fset;
@@ -3228,11 +3183,9 @@ extern "C" int diretta_output_init(const diretta_config_t *cfg) {
             case DIRETTA_TM_AUTOFIX: tmode_name = "autofix"; break;
         }
         std::fprintf(stderr,
-            "[diretta] SDK config: target_buffer_ms=%d (setSink buffer) "
-            "thread_mode=0x%x cycle_time_us=%d cycle_min_time_us=%d "
-            "info_cycle_us=%d transfer_mode=%s target_profile_limit_us=%d "
-            "mtu_override=%d\n",
-            g_st.cfg.target_buffer_ms,
+            "[diretta] SDK config: thread_mode=0x%x cycle_time_us=%d "
+            "cycle_min_time_us=%d info_cycle_us=%d transfer_mode=%s "
+            "target_profile_limit_us=%d mtu_override=%d\n",
             g_st.cfg.thread_mode != 0 ? g_st.cfg.thread_mode : 1u,
             g_st.cfg.cycle_us, g_st.cfg.cycle_min_us,
             g_st.cfg.info_cycle_us, tmode_name,
@@ -3243,18 +3196,14 @@ extern "C" int diretta_output_init(const diretta_config_t *cfg) {
     // side of the unified queue and open sequencing.
     std::fprintf(stderr,
         "[pipeline] config: pcm_buffer_ms=%d pcm_prefill_ms=%d "
-        "rebuffer_percent=%.0f%% underrun_rebuffer_ms=%d (0=use percent) "
-        "format_change_cooldown_ms=%d udp_rcvbuf_bytes=%d "
-        "startup_real_delay_ms=%d (0=disabled) "
-        "upstream_idle_timeout_sec=%d (0=disabled) "
+        "rebuffer_percent=%.0f%% format_change_cooldown_ms=%d "
+        "udp_rcvbuf_bytes=%d upstream_idle_timeout_sec=%d (0=disabled) "
         "upstream_pause_timeout_sec=%d (0=disabled)\n",
         g_st.cfg.ring_buffer_ms > 0 ? g_st.cfg.ring_buffer_ms : 1000,
         g_st.cfg.prefill_ms > 0 ? g_st.cfg.prefill_ms : 500,
         g_st.cfg.rebuffer_percent * 100.0f,
-        g_st.cfg.underrun_rebuffer_ms,
         effective_cooldown_ms(),
         g_st.cfg.udp_rcvbuf_bytes,
-        g_st.cfg.startup_real_delay_ms,
         g_st.cfg.upstream_idle_timeout_sec,
         g_st.cfg.upstream_pause_timeout_sec);
 
@@ -3283,33 +3232,14 @@ extern "C" int diretta_output_init(const diretta_config_t *cfg) {
                  total_budget_ms, ring_ms - total_budget_ms);
         }
     }
-    DLOG(1, "tuning: ring_buffer_ms=%d prefill_ms=%d startup_queue_ms=%d "
-         "startup_mute_ms=%d (compatibility diagnostic, default 0) "
-         "rebuffer_percent=%.0f%% "
-         "underrun_rebuffer_ms=%d (0=use rebuffer_percent) "
-         "startup_real_delay_ms=%d (0=disabled; silence after play without "
-         "consuming queue)",
+    DLOG(1, "tuning: ring_buffer_ms=%d prefill_ms=%d rebuffer_percent=%.0f%%",
          g_st.cfg.ring_buffer_ms, g_st.cfg.prefill_ms,
-         g_st.cfg.startup_queue_ms,
-         g_st.cfg.startup_mute_ms,
-         g_st.cfg.rebuffer_percent * 100.0f,
-         g_st.cfg.underrun_rebuffer_ms,
-         g_st.cfg.startup_real_delay_ms);
+         g_st.cfg.rebuffer_percent * 100.0f);
     DLOG(1, "open sequencing: cooldown=%d ms (configurable via "
          "--format-change-cooldown-ms; first open skips cooldown entirely), "
-         "then wait for queue fill >= max(prefill_ms, startup_queue_ms) "
-         "before opening Sync. Hard fallback after %d ms. No startup mute "
-         "applied post-open by default.",
+         "then wait for queue fill >= prefill_ms before opening Sync. "
+         "Hard fallback after %d ms.",
          effective_cooldown_ms(), OPEN_GATE_MAX_WAIT_MS);
-    if (g_st.cfg.startup_mute_ms > 0) {
-        std::fprintf(stderr,
-            "[diretta] WARN: --startup-mute-ms=%d is set; this is a "
-            "compatibility diagnostic knob that mutes real PCM "
-            "AFTER the Sync opens. the current open gate defers Sync open instead — using "
-            "both together will hide the head of the audio twice. "
-            "Recommend leaving --startup-mute-ms at 0.\n",
-            g_st.cfg.startup_mute_ms);
-    }
 
 #ifdef SCREAM2DIRETTA_NO_DIAGNOSTICS
     // Production binary: diagnostic facilities are compile-time disabled.
@@ -3390,7 +3320,7 @@ extern "C" int diretta_output_init(const diretta_config_t *cfg) {
             "(per-file cap; 0=uncapped). Ingress captures the queue input "
             "(post frame-align/partial-carry); egress captures real-PCM "
             "popped from the queue and handed to the SDK (silence emitted "
-            "by prefill/startup-real-delay/mute gates is NOT written). "
+            "by the prefill gate is NOT written). "
             "When --startup-fade-ms > 0, egress dump captures POST-fade "
             "PCM (the same bytes the SDK actually receives). Ingress dump "
             "is NEVER modified by the fade.\n",
@@ -3714,7 +3644,7 @@ extern "C" int diretta_output_send(receiver_data_t *data) {
         DLOG(0, "upstream resumed; replaying paused Sync "
              "(queue clear + prefill + play).");
         g_st.queue.clear();          // drop stale PCM; require fresh prefill
-        g_st.sync->resetGate();      // re-arm mute/prefill/real-delay gates
+        g_st.sync->resetGate();      // re-arm prefill / rebuffer gates
         g_st.sync->activate();       // allow getNewStream() to touch the ring
         g_st.sync->play();           // SDK resume sending
         g_st.paused = false;
@@ -3902,22 +3832,20 @@ extern "C" int diretta_output_send(receiver_data_t *data) {
             g_st.dbg_logged_first_getNewStream = true;
             phase_event("first_getNewStream",
                         "stream_count=%llu queue_fill=%zu/%zu B (~%llu ms) "
-                        "prefillDone=%d muteDone=%d",
+                        "prefillDone=%d",
                         (unsigned long long)cur_streams,
                         g_st.sync->ringFill(), g_st.sync->ringBytes(),
                         (unsigned long long)g_st.sync->ringFillMs(),
-                        g_st.sync->prefillDone() ? 1 : 0,
-                        g_st.sync->muteDone() ? 1 : 0);
+                        g_st.sync->prefillDone() ? 1 : 0);
             dbg_event("first_getNewStream",
                       "stream_count=%llu silent_cycles=%llu real_cycles=%llu "
-                      "queue_fill=%zu/%zu B (~%llu ms) prefillDone=%d muteDone=%d",
+                      "queue_fill=%zu/%zu B (~%llu ms) prefillDone=%d",
                       (unsigned long long)cur_streams,
                       (unsigned long long)g_st.sync->silentCycles(),
                       (unsigned long long)g_st.sync->realCycles(),
                       g_st.sync->ringFill(), g_st.sync->ringBytes(),
                       (unsigned long long)g_st.sync->ringFillMs(),
-                      g_st.sync->prefillDone() ? 1 : 0,
-                      g_st.sync->muteDone() ? 1 : 0);
+                      g_st.sync->prefillDone() ? 1 : 0);
         }
         uint64_t cur_real = g_st.sync->realCycles();
         if (!g_st.dbg_logged_first_real_pcm && cur_real > 0) {
@@ -3948,75 +3876,6 @@ extern "C" int diretta_output_send(receiver_data_t *data) {
         }
         g_st.dbg_last_stream_count = cur_streams;
         g_st.dbg_last_real_cycles  = cur_real;
-    }
-
-    // startup_real_delay observer: emit one-shot begin/end phase events
-    // by polling the Sync's gate state from the receive thread. The Sync
-    // itself does not log; it just runs the gate. Begin fires the first
-    // time we observe the gate consuming silence cycles (target > 0 and
-    // some bytes already emitted) so the begin event reports queue fill
-    // BEFORE the delay window has progressed far. End fires when the
-    // realDelayDone flag flips true. Both events are no-ops if
-    // --startup-real-delay-ms is 0.
-    if (g_st.cfg.startup_real_delay_ms > 0) {
-        const size_t rd_target  = g_st.sync->realDelayBytes();
-        const size_t rd_emitted = g_st.sync->realDelayBytesEmitted();
-        const bool   rd_done    = g_st.sync->realDelayDone();
-        const uint64_t rd_cycles = g_st.sync->realDelayCycles();
-
-        if (!g_st.phase_logged_startup_real_delay_begin &&
-            rd_target > 0 && (rd_emitted > 0 || rd_cycles > 0 || rd_done)) {
-            g_st.phase_logged_startup_real_delay_begin = true;
-            g_st.startup_real_delay_queue_fill_at_begin =
-                g_st.queue_ready ? g_st.queue.available() : 0;
-            g_st.startup_real_delay_pushed_at_begin = g_st.sync->pushedBytes();
-            g_st.startup_real_delay_popped_at_begin = g_st.sync->poppedBytes();
-            phase_event("startup_real_delay_begin",
-                        "delay_ms=%d target_bytes=%llu queue_fill=%llu/%llu B "
-                        "(~%llu ms) popped_so_far=%llu (queue NOT consumed during delay)",
-                        g_st.cfg.startup_real_delay_ms,
-                        (unsigned long long)rd_target,
-                        (unsigned long long)g_st.startup_real_delay_queue_fill_at_begin,
-                        (unsigned long long)(g_st.queue_ready ? g_st.queue.capacity() : 0),
-                        (unsigned long long)g_st.sync->ringFillMs(),
-                        (unsigned long long)g_st.startup_real_delay_popped_at_begin);
-            dbg_event("startup_real_delay_begin",
-                      "delay_ms=%d target_bytes=%llu queue_fill=%llu/%llu B "
-                      "(~%llu ms) popped_so_far=%llu",
-                      g_st.cfg.startup_real_delay_ms,
-                      (unsigned long long)rd_target,
-                      (unsigned long long)g_st.startup_real_delay_queue_fill_at_begin,
-                      (unsigned long long)(g_st.queue_ready ? g_st.queue.capacity() : 0),
-                      (unsigned long long)g_st.sync->ringFillMs(),
-                      (unsigned long long)g_st.startup_real_delay_popped_at_begin);
-        }
-        if (g_st.phase_logged_startup_real_delay_begin &&
-            !g_st.phase_logged_startup_real_delay_end && rd_done) {
-            g_st.phase_logged_startup_real_delay_end = true;
-            const uint64_t popped_now = g_st.sync->poppedBytes();
-            const uint64_t consumed = popped_now - g_st.startup_real_delay_popped_at_begin;
-            phase_event("startup_real_delay_end",
-                        "delay_ms=%d emitted_bytes=%zu/%zu delay_silent_cycles=%llu "
-                        "queue_fill=%zu/%zu B (~%llu ms) queue_consumed_during_delay=%llu B "
-                        "(must be 0)",
-                        g_st.cfg.startup_real_delay_ms,
-                        rd_emitted, rd_target,
-                        (unsigned long long)rd_cycles,
-                        g_st.queue_ready ? g_st.queue.available() : 0,
-                        g_st.queue_ready ? g_st.queue.capacity() : 0,
-                        (unsigned long long)g_st.sync->ringFillMs(),
-                        (unsigned long long)consumed);
-            dbg_event("startup_real_delay_end",
-                      "delay_ms=%d emitted_bytes=%zu/%zu delay_silent_cycles=%llu "
-                      "queue_fill=%zu/%zu B (~%llu ms) queue_consumed_during_delay=%llu B",
-                      g_st.cfg.startup_real_delay_ms,
-                      rd_emitted, rd_target,
-                      (unsigned long long)rd_cycles,
-                      g_st.queue_ready ? g_st.queue.available() : 0,
-                      g_st.queue_ready ? g_st.queue.capacity() : 0,
-                      (unsigned long long)g_st.sync->ringFillMs(),
-                      (unsigned long long)consumed);
-        }
     }
 
     {
@@ -4178,7 +4037,7 @@ ingress_only:
                 "filled to %zu/%zu B (~%llu/%llu ms) before the SDK began "
                 "pulling real PCM. Imminent head-of-track drop unless the "
                 "SDK opens and pulls within the next ~%llu ms. Consider "
-                "--ring-buffer-ms %d --format-change-cooldown-ms %d.\n",
+                "--pcm-buffer-ms %d --format-change-cooldown-ms %d.\n",
                 fill, cap,
                 (unsigned long long)fill_ms,
                 (unsigned long long)cap_ms,
