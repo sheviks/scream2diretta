@@ -53,7 +53,9 @@ typedef enum diretta_transfer_mode_e {
     DIRETTA_TM_AUTOFIX,     /* configTransferFixAuto when cycletime set, else auto B-branch */
 } diretta_transfer_mode_t;
 
-/* SDK SysLog floor when --diretta-debug is off. -v/-vv do not raise this. */
+#define DIRETTA_DEFAULT_TARGET_INFO_PATH "/var/log/s2d-target.log"
+
+/* SDK SysLog floor when --target-info is off. -v/-vv/--diretta-debug do not raise this. */
 typedef enum diretta_log_level_e {
     DIRETTA_LOG_DEFAULT = 0,    /* Notice */
     DIRETTA_LOG_DEBUG,          /* Debug  */
@@ -128,17 +130,19 @@ typedef struct diretta_config_s {
     int dsd_buffer_ms;
     int dsd_prefill_ms;
 
-    /* Periodic producer-side stats reporting in seconds. 0 = off (only the
-     * one-shot shutdown summary at -v / explicit stats is printed). When >0
-     * and either verbose or stats are enabled, a single line with pushed /
-     * dropped / underrun / fill counters is printed every N seconds. The
-     * print is rate-limited and runs from the receiver thread, so it is
-     * never on the audio hot path. */
+    /* Periodic producer-side stats reporting in seconds. Default 5.
+     * Printed only when --stats is set or verbosity >= 1 (-v/-vv).
+     * Interval 0 still means "every call" (do not use as off). Off is
+     * stats_enabled=0 and verbosity=0. The print is rate-limited and
+     * runs from the receiver thread, never on the audio hot path. */
     int stats_interval_sec;
     /* Force stats printing even without --verbose. */
     int stats_enabled;
 
     diretta_log_level_t log_level;
+    /* 0=auto (TTY only), 1=always (default; systemd file + tail -f),
+     * 2=never. NO_COLOR wins. */
+    int log_color;
 
     /* PCM dump diagnostics. When --dump-ingress-wav / --dump-egress-wav
      * is set, the backend writes the corresponding PCM stream into one or
@@ -217,20 +221,19 @@ typedef struct diretta_config_s {
      * only; the socket itself is configured by init_network(). */
     int udp_rcvbuf_bytes;
 
-    /*  detailed Diretta SDK phase tracing. When non-zero, the backend
-     * emits dense [diretta-debug] lines covering every Sync/Target lifecycle
-     * step (sync_open_begin/_end, connect_begin/_return, is_connect_true,
-     * first_getNewStream, first_real_pcm, format_change_cleanup_begin/_end,
-     * setSink/setSinkConfigure/inquirySupportFormat/connectPrepare/play,
-     * MTU + sink Info, target inquiry/profile params) with monotonic
-     * timestamps relative to the last format-change-accepted instant.
-     * Also hooks DIRETTA::SysLogDiretta at Debug through ACQUA's StdErrOut
-     * callback so Host SDK lines (info rcv / FEEDBACK) appear as `[sdk] `
-     * on stderr — the same stream as other [diretta] messages. port=0
-     * disables logcatch UDP. No-op with a -nolog archive.
-     *
-     * Independent of -v / -vv. Default 0 (off). */
+    /* s2d Sync/Target process trace. When non-zero, the backend emits
+     * dense [diretta-debug] lines for every Host API step (setSink,
+     * connect, play, format_change_cleanup, …) with monotonic timestamps.
+     * Does NOT attach Host SDK syslog (info rcv / FEEDBACK); that is
+     * --target-info. Independent of -v / -vv. Default 0 (off). */
     int diretta_debug;
+
+    /* Host SDK / Target Info syslog destination. When non-NULL, attach
+     * ACQUA StdErrOut at Debug and write `[sdk] info rcv / Request Info /
+     * Stream Rest` (InfoCycle, default 100 ms) to this path (append).
+     * Bare --target-info uses DIRETTA_DEFAULT_TARGET_INFO_PATH.
+     * "-" = stderr. NULL = off. Independent of -v / -vv / --diretta-debug. */
+    const char *target_info_path;
 } diretta_config_t;
 
 /* Snapshot of producer-side counters; safe to read from any thread. */

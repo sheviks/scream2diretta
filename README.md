@@ -215,8 +215,8 @@ sudo ./scream2diretta --list-targets
 # Run with the first target (default multicast 239.255.77.77:4010)
 sudo ./scream2diretta
 
-# Pin to target #1, unicast port 4010, verbose stats every 5s
-sudo ./scream2diretta -t 1 -p 4010 -vv --stats --stats-interval 5
+# Pin to target #1, unicast port 4010, per-open summary + stats every 5s
+sudo ./scream2diretta -t 1 -p 4010 -v
 
 # With CPU affinity (recommended for best sound quality)
 sudo ./scream2diretta -t 1 -p 4010 \
@@ -248,8 +248,32 @@ sudo ./scream2diretta -t 1 -p 4010 \
 | `--cpu-other <core>` | — | Pin helper threads to core |
 | `--rt-priority <1-99>` | — | SCHED_FIFO priority for receiver & SDK worker |
 | `--no-mlock` | off | Disable `mlockall` (default pins all pages in RAM) |
-| `--stats --stats-interval <sec>` | off | Periodic stats |
-| `-v` / `-vv` | off | Verbose / very verbose |
+| `--stats --stats-interval <sec>` | off / 5s | Periodic stats (`--stats` or `-v`; interval default 5) |
+| `-v` | off | Per-open summary (transfer profile, ring, play) plus stats |
+| `-vv` | off | Per-open handshake timeline (`[diretta-phase]`) |
+| `--diretta-debug` | off | s2d Sync/Target process trace (`[diretta-debug] +Nms`) |
+| `--target-info [path]` | off | Host/Target Info syslog to `path` (default `/var/log/s2d-target.log`; `-` = stderr) |
+| `--color <mode>` | always | `always` / `auto` (TTY only) / `never`. `*`/`!`/`~` markers |
+
+### Logging
+
+Four independent streams — they do not imply each other:
+
+| Stream | Contents |
+|--------|----------|
+| default (no `-v`) | State changes only: `ready`, `format`, `playing`, reconnect-after-loss, idle release, underrun, errors |
+| `-v` | Per-open summary (`transfer:`, ring, play, MS mode) plus periodic `stats[...]` |
+| `-vv` | Handshake timeline (`[diretta-phase] +N/+Mms` with aligned event names) |
+| `--diretta-debug` | s2d Sync/Target process trace (`[diretta-debug]`). Does **not** dump Host SDK `info rcv` |
+| `--target-info [path]` | Host SDK syslog (`[sdk] info rcv` / `FEEDBACK` / `Stream Rest`) appended to `path`. Omit path for `/var/log/s2d-target.log`; `-` writes to stderr (the main log under systemd) |
+
+Every s2d line starts with a marker that works in files as well as a TTY: `*` key, `!` warn/underrun, `~` stats. `--color` defaults to `always` so `tail -f /var/log/scream2diretta.log` shows ANSI (systemd append is not a TTY). `--color never` or `NO_COLOR=1` disables color; markers remain.
+
+`--stats` forces the 5 s stats line without `-v`. `--stats-interval` only changes the period.
+
+### Overhead cache
+
+On the first Sync open (any transfer mode), s2d probes 44.1 kHz PCM 16/24/32-bit with VarMax before `connect`/`play`, takes the minimum 1-packet leftover, and stores it as protocol overhead. The file is `overhead-<sanitised-addr>-mtu<N>.txt` under `$STATE_DIRECTORY` (systemd: `/var/lib/scream2diretta`) or `~/.config/scream2diretta`. `N` is the **active send MTU** (`min(path measSendMTU or --mtu, Target reqMTU or maxMTU)`), so a jumbo NIC with the Target still at 1500 calibrates against 1500. If that file exists, idle-release reconnect skips the probe.
 
 ### Transfer Modes
 
@@ -289,7 +313,7 @@ default) otherwise.
 Under an active Target Profile (`--target-profile-limit > 0`), `autofix`
 is equivalent to `fixauto` (`pm.configTransferFixAuto(cycle)`).
 
-#### Reading the `transfer:` log line (`-vv`)
+#### Reading the `transfer:` log line (`-v`)
 
 ```
 transfer: mtu=1518 mode=auto-varauto-cycle mode_sdk=variable target_cycle=800us sdk_cycle=803us cycle_size=616B cycle_packets=1

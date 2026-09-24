@@ -10,8 +10,9 @@
 #include <Diretta/Sync>
 #include <Diretta/Stream>
 
+#include <cerrno>
+#include <cstdio>
 #include <cstring>
-#include <iostream>
 #include <thread>
 
 extern int verbosity;
@@ -277,15 +278,18 @@ bool ScreamDirettaSync::getNewStream(diretta_stream& s) {
             struct sched_param param;
             param.sched_priority = prio;
             if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &param) == 0) {
-                std::cout << "[diretta] SDK worker set to SCHED_FIFO priority "
-                          << prio << std::endl;
+                if (verbosity >= 1) {
+                    std::fprintf(stderr,
+                        "[diretta] SDK worker set to SCHED_FIFO priority %d\n",
+                        prio);
+                }
                 m_rtPriorityApplied.store(true, std::memory_order_release);
             } else {
                 const int attempts = m_rtPriorityAttempts.fetch_add(1, std::memory_order_relaxed) + 1;
-                std::cerr << "[diretta] WARNING: Failed to set SDK worker "
-                          << "SCHED_FIFO priority " << prio
-                          << " (errno=" << errno << ") attempt " << attempts << "/"
-                          << RT_PRIORITY_MAX_ATTEMPTS << std::endl;
+                std::fprintf(stderr,
+                    "[diretta] WARNING: Failed to set SDK worker "
+                    "SCHED_FIFO priority %d (errno=%d) attempt %d/%d\n",
+                    prio, errno, attempts, RT_PRIORITY_MAX_ATTEMPTS);
                 if (attempts >= RT_PRIORITY_MAX_ATTEMPTS) {
                     m_rtPriorityApplied.store(true, std::memory_order_release);
                 }

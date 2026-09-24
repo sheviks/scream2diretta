@@ -9,7 +9,8 @@
 # Both 'daily' and 'size' are present: rotation triggers on whichever
 # condition is met first.  This prevents unbounded growth during
 # extended debug sessions or persistent underrun storms.
-/var/log/scream2diretta.log {
+/var/log/scream2diretta.log
+/var/log/s2d-target.log {
     daily
     size 10M
     rotate 14

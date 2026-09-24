@@ -38,6 +38,7 @@ extern "C" {
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <fstream>
@@ -45,6 +46,10 @@ extern "C" {
 #include <string>
 #include <thread>
 #include <vector>
+
+#if !defined(_WIN32)
+#include <unistd.h>
+#endif
 
 #if defined(__linux__)
 #include <pthread.h>
@@ -81,7 +86,8 @@ struct DirettaState {
     diretta_config_t cfg{};
 
     IPAddress sink_addr;
-    uint32_t mtu = 0;
+    uint32_t path_mtu = 0;  // measSendMTU / --mtu (link probe)
+    uint32_t mtu = 0;       // active send MTU: min(path, Target reqMTU/maxMTU)
 
     Find* finder = nullptr;
     scream_diretta::ScreamDirettaSync* sync = nullptr;
@@ -392,9 +398,86 @@ DirettaState g_st;
 extern "C" int g_diretta_diag_armed_flag = 0;
 #endif
 
+// Line emphasis for scanning -vv / mixed logs.
+// Marker is always written and sits before any ANSI so `grep '^\*'` still
+// works when color is in the file. Default --color=always so
+// `tail -f /var/log/scream2diretta.log` shows color (systemd append is not
+// a TTY, so auto-by-isatty would never color). NO_COLOR / --color never
+// disable color.
+enum class LogHi { Info, Key, Warn, Err, Phase, Dbg, Stats };
+
+static bool log_use_color(FILE* fp) {
+    const int mode = g_st.cfg.log_color; // 0 auto, 1 always, 2 never
+    if (mode == 2) return false;
+    const char* no = std::getenv("NO_COLOR");
+    if (no && no[0] != '\0') return false;
+    if (mode == 1) return true;
+#if !defined(_WIN32)
+    const int fd = fileno(fp);
+    return fd >= 0 && isatty(fd);
+#else
+    (void)fp;
+    return false;
+#endif
+}
+
+static LogHi classify_dlog_body(const char* body) {
+    if (!body || !body[0]) return LogHi::Info;
+    if (std::strncmp(body, "playing:", 8) == 0 ||
+        std::strncmp(body, "format:", 7) == 0 ||
+        std::strncmp(body, "ready:", 6) == 0 ||
+        std::strncmp(body, "transfer:", 9) == 0) {
+        return LogHi::Key;
+    }
+    if (std::strncmp(body, "underrun_recover", 16) == 0) return LogHi::Key;
+    if (std::strncmp(body, "underrun", 8) == 0 ||
+        std::strncmp(body, "FATAL", 5) == 0) {
+        return LogHi::Err;
+    }
+    if (std::strncmp(body, "stats[", 6) == 0) return LogHi::Stats;
+    if (std::strncmp(body, "[warn]", 6) == 0 ||
+        std::strncmp(body, "WARN", 4) == 0 ||
+        std::strncmp(body, "reconnecting", 12) == 0 ||
+        std::strstr(body, "WARNING") != nullptr ||
+        std::strstr(body, " failed") != nullptr ||
+        std::strstr(body, "failing") != nullptr ||
+        std::strstr(body, "connection lost") != nullptr) {
+        return LogHi::Warn;
+    }
+    return LogHi::Info;
+}
+
+static void emit_log(FILE* fp, LogHi hi, const char* tag, const char* body) {
+    if (!fp || !body) return;
+    const bool color = log_use_color(fp);
+    const char* mark = " ";
+    const char* on = "";
+    const char* off = "";
+    switch (hi) {
+        case LogHi::Key:   mark = "*"; if (color) { on = "\033[1;36m"; off = "\033[0m"; } break;
+        case LogHi::Warn:  mark = "!"; if (color) { on = "\033[1;33m"; off = "\033[0m"; } break;
+        case LogHi::Err:   mark = "!"; if (color) { on = "\033[1;31m"; off = "\033[0m"; } break;
+        case LogHi::Stats: mark = "~"; if (color) { on = "\033[2;34m"; off = "\033[0m"; } break;
+        case LogHi::Phase: mark = " "; if (color) { on = "\033[2m";    off = "\033[0m"; } break;
+        case LogHi::Dbg:   mark = " "; if (color) { on = "\033[2m";    off = "\033[0m"; } break;
+        case LogHi::Info:  mark = " "; break;
+    }
+    std::fprintf(fp, "%s %s[%s] %s%s\n", mark, on, tag, body, off);
+}
+
+__attribute__((format(printf, 1, 2)))
+static void emit_dlog(const char* fmt, ...) {
+    char body[768];
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(body, sizeof(body), fmt, ap);
+    va_end(ap);
+    emit_log(stderr, classify_dlog_body(body), "diretta", body);
+}
+
 #define DLOG(level, fmt, ...) do { \
     if (verbosity >= (level)) { \
-        std::fprintf(stderr, "[diretta] " fmt "\n", ##__VA_ARGS__); \
+        emit_dlog(fmt, ##__VA_ARGS__); \
     } \
 } while (0)
 
@@ -413,15 +496,13 @@ static const char* msmode_name(Sync::MSMODE m) {
 
 // Phase-trace helpers.
 //
-// Independent of -v / -vv: when --diretta-debug is set, every event below
-// is emitted to stderr with monotonic timestamps relative to the most
-// recent format-change-accept (the "global" anchor) and, when applicable,
-// the most recent sync_open_begin (the "open" anchor). This gives the
-// user a deterministic timeline to overlay against any audible click.
+// --diretta-debug: dbg_event -> [diretta-debug] +Nms (s2d Sync/Target
+// process trace). Independent of -v / -vv, and does not include Host SDK
+// info rcv (that is --target-info).
+//
+// -vv: phase_event -> [diretta-phase] (human handshake timeline).
 //
 // Format: "[diretta-debug] +<ms>ms (+<open_ms>ms since open_begin) <event>: <details>".
-// Events use stable snake_case names matching the spec so log greps stay
-// simple.
 
 static inline bool dbg_on() { return g_st.cfg.diretta_debug != 0; }
 
@@ -459,17 +540,11 @@ static void dbg_reset_open_flags() {
     g_st.rebuffering_logged = false;
 }
 
-// Always-on phase emitter for the small set of once-per-open
-// events the user wants to see by default (setSink, connect, connectWait,
-// play, is_connect_true, first_getNewStream, first_real_pcm,
-// open_grace_*). Independent of --diretta-debug and of -v. Emits one
-// short line per phase with a monotonic ms-relative timestamp anchored
-// at the most recent sync_open_begin (falls back to dbg_anchor or "now").
+// Once-per-open handshake timeline for -vv. Not --diretta-debug (that
+// uses dbg_event / [diretta-debug]) and not -v (that is the summary line).
 __attribute__((format(printf, 2, 3)))
 static void phase_event(const char* event, const char* fmt, ...) {
-    // Phase events are detailed step-by-step diagnostics. Suppress by
-    // default; enable only with --diretta-debug or -vv.
-    if (!g_st.cfg.diretta_debug && verbosity < 2) return;
+    if (verbosity < 2) return;
     auto now = std::chrono::steady_clock::now();
     long long rel_open_ms = -1;
     long long rel_ms = 0;
@@ -490,16 +565,17 @@ static void phase_event(const char* event, const char* fmt, ...) {
     } else {
         details[0] = '\0';
     }
+    char body[512];
     if (rel_open_ms >= 0) {
-        std::fprintf(stderr,
-            "[diretta-phase] +%lldms (+%lldms since open_begin) %s%s%s\n",
-            rel_ms, rel_open_ms, event,
-            details[0] ? ": " : "", details);
+        std::snprintf(body, sizeof(body), "+%lld/+%lldms  %-28s%s%s",
+                      rel_ms, rel_open_ms, event,
+                      details[0] ? " " : "", details);
     } else {
-        std::fprintf(stderr,
-            "[diretta-phase] %s%s%s\n",
-            event, details[0] ? ": " : "", details);
+        std::snprintf(body, sizeof(body), "+%lldms  %-28s%s%s",
+                      rel_ms, event,
+                      details[0] ? " " : "", details);
     }
+    emit_log(stderr, LogHi::Phase, "diretta-phase", body);
 }
 
 // printf-like phase event emitter. The first %s in the fmt is reserved
@@ -528,20 +604,21 @@ static void dbg_event(const char* event, const char* fmt, ...) {
     } else {
         details[0] = '\0';
     }
+    char body[640];
     if (rel_open_ms >= 0) {
-        std::fprintf(stderr,
-            "[diretta-debug] +%lldms (+%lldms since open_begin) %s%s%s\n",
-            rel_ms, rel_open_ms, event,
-            details[0] ? ": " : "", details);
+        std::snprintf(body, sizeof(body), "+%lld/+%lldms  %-28s%s%s",
+                      rel_ms, rel_open_ms, event,
+                      details[0] ? " " : "", details);
     } else {
-        std::fprintf(stderr,
-            "[diretta-debug] +%lldms %s%s%s\n",
-            rel_ms, event, details[0] ? ": " : "", details);
+        std::snprintf(body, sizeof(body), "+%lldms  %-28s%s%s",
+                      rel_ms, event,
+                      details[0] ? " " : "", details);
     }
+    emit_log(stderr, LogHi::Dbg, "diretta-debug", body);
 }
 
 static bool stats_should_print() {
-    return (g_st.cfg.stats_enabled || verbosity > 0);
+    return (g_st.cfg.stats_enabled || verbosity >= 1);
 }
 
 // Default cooldown between tearing down a Sync and opening a
@@ -770,40 +847,70 @@ static SysLog::SysLogLevel map_log_level(diretta_log_level_t l) {
     }
 }
 
-// Host SDK SysLog independent-output callback (ACQUA::SysLog::StdErrOut).
-// systemd StandardOutput=append is not a TTY, so libc fully-buffers stdout
-// and DRUP's "direct to stdout" path never shows up in tail -f. stderr is
-// the same stream s2d already uses (and the unit appends both).
+// Host SDK / Target Info SysLog callback. systemd StandardOutput=append is
+// not a TTY, so libc fully-buffers stdout and the SDK's "direct to stdout"
+// path never shows up in tail -f. --target-info writes here (default
+// /var/log/s2d-target.log). "-" means stderr.
+static FILE* g_target_info_log = nullptr;
+static bool g_target_info_owned = false;
+
+static void close_target_info_log() {
+    if (g_target_info_owned && g_target_info_log &&
+        g_target_info_log != stderr && g_target_info_log != stdout) {
+        std::fclose(g_target_info_log);
+    }
+    g_target_info_log = nullptr;
+    g_target_info_owned = false;
+}
+
 static void sdk_syslog_emit(const char* msg) {
     if (!msg || msg[0] == '\0') return;
-    std::fputs("[sdk] ", stderr);
-    std::fputs(msg, stderr);
+    FILE* out = g_target_info_log ? g_target_info_log : stderr;
+    std::fputs("[sdk] ", out);
+    std::fputs(msg, out);
     const size_t n = std::strlen(msg);
     if (n == 0 || msg[n - 1] != '\n')
-        std::fputc('\n', stderr);
+        std::fputc('\n', out);
+    std::fflush(out);
 }
 
 static void init_syslog(const diretta_config_t& cfg) {
     static bool done = false;
     if (done) return;
-    if (cfg.diretta_debug) {
-        // SysLogDiretta::initialize alone (DRUP DIRETTA_SDK_SYSLOG_DEBUG)
-        // still left Host SDK lines invisible under systemd file redirect.
-        // Attach ACQUA's StdErrOut callback last so every SDK line is
-        // written to stderr with an [sdk] prefix. port=0: no logcatch UDP.
-        // No-op when linked against a -nolog archive.
+    const char* path = cfg.target_info_path;
+    if (path && path[0] != '\0') {
+        if (std::strcmp(path, "-") == 0) {
+            g_target_info_log = stderr;
+            g_target_info_owned = false;
+        } else {
+            g_target_info_log = std::fopen(path, "a");
+            if (!g_target_info_log) {
+                DLOG(0, "WARNING: --target-info '%s' open failed (%s); "
+                     "Host SDK syslog falling back to stderr",
+                     path, std::strerror(errno));
+                g_target_info_log = stderr;
+                g_target_info_owned = false;
+            } else {
+                std::setvbuf(g_target_info_log, nullptr, _IOLBF, 0);
+                g_target_info_owned = true;
+            }
+        }
+        // SysLogDiretta::initialize alone still left Host SDK lines
+        // invisible under systemd file redirect. Attach ACQUA's callback
+        // so every SDK line is written with an [sdk] prefix. port=0: no
+        // logcatch UDP. No-op when linked against a -nolog archive.
         (void)SysLogDiretta::initialize(SysLog::user, /*port*/ 0, /*st*/ false);
         const bool cb_ok = SysLog::initialize(SysLog::user, sdk_syslog_emit);
         SysLogDiretta::changeLevel(SysLog::Debug, /*port*/ 0);
-        std::fprintf(stderr,
-            "[diretta-debug] Host SDK SysLog attached to stderr via callback "
-            "(%s); level=Debug. Expect [sdk] info rcv / FEEDBACK every "
-            "InfoCycle (~100 ms).\n",
-            cb_ok ? "ok" : "fail");
+        DLOG(1, "Host SDK SysLog attached (%s) dest=%s; [sdk] info rcv / "
+             "FEEDBACK every InfoCycle (~100 ms)",
+             cb_ok ? "ok" : "fail",
+             (g_target_info_log == stderr) ? "stderr" : path);
         SysLog::Debug << "s2d syslog probe";
     } else {
-        // Notice/Warning only; no Debug, no logcatch UDP. -v/-vv must not
-        // leak Host SDK FEEDBACK onto 19640.
+        // Notice/Warning only; no Debug, no logcatch UDP. -v/-vv/
+        // --diretta-debug must not leak Host SDK FEEDBACK onto 19640
+        // or onto the main s2d log.
         SysLog::initialize(SysLog::local0, /*erout*/ false, /*port*/ 0);
         SysLogDiretta::changeLevel(map_log_level(cfg.log_level), /*port*/ 0);
     }
@@ -859,7 +966,7 @@ static std::string overhead_cache_dir() {
     return "/tmp/scream2diretta";
 }
 
-static std::string overhead_cache_file(const IPAddress& addr) {
+static std::string overhead_cache_file(const IPAddress& addr, uint32_t mtu) {
     std::string s = ip_to_str(addr);
     // Sanitise for use as a filename: replace : % , with safe chars.
     for (char& c : s) {
@@ -867,7 +974,7 @@ static std::string overhead_cache_file(const IPAddress& addr) {
         else if (c == '%') c = '-';
         else if (c == ',') c = '.';
     }
-    return overhead_cache_dir() + "/overhead-" + s + ".txt";
+    return overhead_cache_dir() + "/overhead-" + s + "-mtu" + std::to_string(mtu) + ".txt";
 }
 
 static void ensure_cache_dir() {
@@ -894,8 +1001,9 @@ static void ensure_cache_dir() {
 #endif
 }
 
-static int load_inferred_overhead(const IPAddress& addr) {
-    const std::string path = overhead_cache_file(addr);
+static int load_inferred_overhead(const IPAddress& addr, uint32_t mtu) {
+    if (mtu == 0) return -1;
+    const std::string path = overhead_cache_file(addr, mtu);
     std::ifstream f(path);
     if (!f) return -1;
     int val = -1;
@@ -903,10 +1011,10 @@ static int load_inferred_overhead(const IPAddress& addr) {
     return -1;
 }
 
-static void save_inferred_overhead(const IPAddress& addr, int overhead) {
-    if (overhead <= 0 || overhead >= 200) return;
+static void save_inferred_overhead(const IPAddress& addr, uint32_t mtu, int overhead) {
+    if (overhead <= 0 || overhead >= 200 || mtu == 0) return;
     ensure_cache_dir();
-    const std::string path = overhead_cache_file(addr);
+    const std::string path = overhead_cache_file(addr, mtu);
     std::ofstream f(path);
     if (f) {
         f << overhead << "\n";
@@ -948,17 +1056,186 @@ static unsigned int calculateCycleTime(uint32_t sampleRate,
     } else {
         overhead = (mtu > 2000u) ? 6 : 22;  // jumbo: IP-layer; standard: link-layer
     }
-    const uint32_t effMtu = (mtu > static_cast<uint32_t>(overhead))
-                                ? (mtu - overhead)
-                                : 1476u;
+    uint32_t payload = (mtu > static_cast<uint32_t>(overhead))
+                           ? (mtu - static_cast<uint32_t>(overhead))
+                           : 1476u;
+    // Floor to a whole PCM/DSD frame. Without this, a 24-bit-inferred
+    // overhead of 2 yields payload=3822, which is not divisible by 4, and
+    // VarMax on 16-bit splits into cycle_packets=2.
+    const uint32_t bpf = channels * (bitsPerSample / 8u);
+    if (bpf > 0) {
+        payload = (payload / bpf) * bpf;
+        if (payload == 0) payload = bpf;
+    }
     const double bytesPerSecond = static_cast<double>(sampleRate)
                                   * static_cast<double>(channels)
                                   * static_cast<double>(bitsPerSample) / 8.0;
     if (bytesPerSecond <= 0.0) return 200u;
-    const double cycleTimeUs = (static_cast<double>(effMtu) / bytesPerSecond)
+    const double cycleTimeUs = (static_cast<double>(payload) / bytesPerSecond)
                                * 1000000.0;
     unsigned int result = static_cast<unsigned int>(std::round(cycleTimeUs));
     return std::max(100u, std::min(result, 50000u));
+}
+
+// configTransferVarMax then shrink the cycle until the SDK reports one
+// packet per cycle, or a small retry budget is exhausted. Host-side
+// frame flooring usually makes the first call already packets==1; this
+// catches SDK round-up that still crosses the one-packet ceiling.
+static unsigned int config_transfer_varmax_one_packet(
+    Sync& sb,
+    unsigned int cycle_us,
+    uint32_t sample_rate,
+    uint32_t channels,
+    uint32_t bits_per_sample)
+{
+    sb.configTransferVarMax(Clock::MicroSeconds(cycle_us));
+    const uint32_t bpf = channels * (bits_per_sample / 8u);
+    const double bps = static_cast<double>(sample_rate)
+                       * static_cast<double>(channels)
+                       * static_cast<double>(bits_per_sample) / 8.0;
+    if (bpf == 0 || bps <= 0.0) return cycle_us;
+
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        if (sb.getCyclePackets() <= 1) return cycle_us;
+        const size_t cs = sb.getCycleSize();
+        if (cs <= bpf) break;
+        size_t next_payload = ((cs - bpf) / bpf) * bpf;
+        if (next_payload < bpf) break;
+        unsigned int next_us = static_cast<unsigned int>(
+            std::round(static_cast<double>(next_payload) / bps * 1000000.0));
+        next_us = std::max(100u, std::min(next_us, 50000u));
+        if (next_us >= cycle_us) {
+            if (cycle_us <= 100u) break;
+            next_us = cycle_us - 1u;
+        }
+        DLOG(1, "varmax 1-packet retry: packets=%zu cycle_size=%zu cycle_us %u -> %u",
+             (size_t)sb.getCyclePackets(), cs, cycle_us, next_us);
+        cycle_us = next_us;
+        sb.configTransferVarMax(Clock::MicroSeconds(cycle_us));
+    }
+    if (sb.getCyclePackets() > 1) {
+        DLOG(0, "[warn] varmax still cycle_packets=%zu after retries "
+             "(cycle_size=%zu cycle_us=%u)",
+             (size_t)sb.getCyclePackets(), (size_t)sb.getCycleSize(), cycle_us);
+    }
+    return cycle_us;
+}
+
+static int default_overhead_guess(uint32_t mtu) {
+    return (mtu > 2000u) ? 6 : 22;
+}
+
+// Target's configured/capability MTU from inquiry. reqMTU is the live
+// setting (e.g. 1500 while the NIC path is 3824); maxMTU is the ceiling.
+static uint32_t sink_advertised_mtu(const Sync& sb) {
+    const Sync::Info& si = sb.getSinkInfo();
+    if (si.reqMTU > 0) return si.reqMTU;
+    if (si.maxMTU > 0) return si.maxMTU;
+    return 0;
+}
+
+static uint32_t resolve_active_mtu(const Sync& sb, uint32_t path_mtu) {
+    const uint32_t sink = sink_advertised_mtu(sb);
+    if (sink == 0) return path_mtu;
+    if (path_mtu == 0) return sink;
+    return std::min(path_mtu, sink);
+}
+
+// Grow a 1-packet VarMax profile by one frame until the SDK splits, then
+// revert. Returns cycle_size of the largest 1-packet payload, or 0.
+static size_t probe_max_one_packet_payload(Sync& sb,
+                                           uint32_t sample_rate,
+                                           uint32_t channels,
+                                           uint32_t bits_per_sample,
+                                           uint32_t mtu) {
+    const uint32_t bpf = channels * (bits_per_sample / 8u);
+    const double bps = static_cast<double>(sample_rate)
+                       * static_cast<double>(channels)
+                       * static_cast<double>(bits_per_sample) / 8.0;
+    if (bpf == 0 || bps <= 0.0 || mtu == 0) return 0;
+
+    const int oh = default_overhead_guess(mtu);
+    uint32_t payload = (mtu > static_cast<uint32_t>(oh))
+                           ? (mtu - static_cast<uint32_t>(oh)) : 1476u;
+    payload = (payload / bpf) * bpf;
+    if (payload == 0) payload = bpf;
+
+    auto cycle_for = [&](uint32_t bytes) -> unsigned int {
+        unsigned int us = static_cast<unsigned int>(
+            std::round(static_cast<double>(bytes) / bps * 1000000.0));
+        return std::max(100u, std::min(us, 50000u));
+    };
+
+    unsigned int cycle_us = config_transfer_varmax_one_packet(
+        sb, cycle_for(payload), sample_rate, channels, bits_per_sample);
+    if (sb.getCyclePackets() != 1) return 0;
+
+    size_t best = sb.getCycleSize();
+    for (int i = 0; i < 16; ++i) {
+        const size_t next = best + bpf;
+        if (next >= mtu) break;
+        const unsigned int next_us = cycle_for(static_cast<uint32_t>(next));
+        sb.configTransferVarMax(Clock::MicroSeconds(next_us));
+        if (sb.getCyclePackets() != 1) {
+            config_transfer_varmax_one_packet(
+                sb, cycle_us, sample_rate, channels, bits_per_sample);
+            break;
+        }
+        cycle_us = next_us;
+        best = sb.getCycleSize();
+        if (best < next) break;  // SDK did not take the extra frame
+    }
+    return best;
+}
+
+// Missing (target, MTU) cache: measure leftover at bpf 4/6/8 via VarMax
+// (no connect/play) and store the minimum. Call after setSink.
+static void calibrate_overhead_if_missing(Sync& sb, uint32_t mtu) {
+    if (g_st.inferred_overhead > 0) return;
+    if (mtu == 0) return;
+
+    DLOG(0, "overhead cache missing for %s mtu=%u; calibrating (16/24/32-bit, no play)",
+         ip_to_str(g_st.sink_addr).c_str(), (unsigned)mtu);
+
+    sb.inquirySupportFormat(g_st.sink_addr);
+
+    int best_oh = 199;
+    bool any = false;
+    static const uint32_t kBits[] = {16u, 24u, 32u};
+    for (uint32_t bits : kBits) {
+        FormatConfigure fc(FormatID::CHA_2 | pcm_id_for_bits(static_cast<unsigned char>(bits))
+                           | FormatID::RAT_44100 | FormatID::RAT_MP1);
+        if (!fc.isValid() || !sb.checkSinkSupport(fc)) {
+            DLOG(1, "overhead calibrate: skip %u-bit (unsupported)", bits);
+            continue;
+        }
+        if (!sb.setSinkConfigure(fc)) {
+            DLOG(1, "overhead calibrate: setSinkConfigure(%u-bit) failed", bits);
+            continue;
+        }
+        const size_t payload = probe_max_one_packet_payload(
+            sb, /*rate*/ 44100u, /*ch*/ 2u, bits, mtu);
+        if (payload == 0 || payload >= mtu) {
+            DLOG(1, "overhead calibrate: %u-bit no 1-packet payload", bits);
+            continue;
+        }
+        const int leftover = static_cast<int>(mtu - payload);
+        if (leftover <= 0 || leftover >= 200) continue;
+        DLOG(1, "overhead calibrate: %u-bit cycle_size=%zu leftover=%d",
+             bits, payload, leftover);
+        if (leftover < best_oh) best_oh = leftover;
+        any = true;
+    }
+
+    if (any && best_oh > 0 && best_oh < 200) {
+        g_st.inferred_overhead = best_oh;
+        save_inferred_overhead(g_st.sink_addr, mtu, best_oh);
+        DLOG(0, "overhead calibrated: %d (mtu=%u, min leftover over supported 16/24/32)",
+             best_oh, (unsigned)mtu);
+    } else {
+        DLOG(0, "overhead calibrate failed; using default guess %d",
+             default_overhead_guess(mtu));
+    }
 }
 
 // Returns the human-readable mode name actually applied (for -vv logging).
@@ -972,9 +1249,9 @@ static const char* apply_transfer_mode(Sync& sb,
                                        uint32_t bits_per_sample,
                                        bool is_dsd,
                                        unsigned int& out_effective_cycle_us) {
-    const uint32_t effective_mtu = cfg.mtu_override > 0
-        ? static_cast<uint32_t>(cfg.mtu_override)
-        : g_st.mtu;
+    const uint32_t effective_mtu = g_st.mtu > 0
+        ? g_st.mtu
+        : (cfg.mtu_override > 0 ? static_cast<uint32_t>(cfg.mtu_override) : 0);
     // varmax_cycle = cycle time that exactly fills one effMtu packet at the
     // current format. Used both as the auto-default cycle and as the
     // "1 packet per cycle" upper bound when the user gives an explicit cycle.
@@ -1041,9 +1318,14 @@ static const char* apply_transfer_mode(Sync& sb,
         return name;
     }
 
+    auto apply_varmax = [&](unsigned int us) -> unsigned int {
+        return config_transfer_varmax_one_packet(
+            sb, us, sample_rate, channels, bits_per_sample);
+    };
+
     switch (cfg.transfer_mode) {
         case DIRETTA_TM_VARMAX:
-            sb.configTransferVarMax(cycle);
+            out_effective_cycle_us = apply_varmax(cycle_us);
             return "varmax";
         case DIRETTA_TM_VARAUTO:
             sb.configTransferVarAuto(cycle);
@@ -1079,8 +1361,7 @@ static const char* apply_transfer_mode(Sync& sb,
                             "%uHz/%ubit/%uch; falling back to varmax",
                          cycle_us, varmax_cycle, safe_max,
                          sample_rate, bits_per_sample, channels);
-                    sb.configTransferVarMax(Clock::MicroSeconds(varmax_cycle));
-                    out_effective_cycle_us = varmax_cycle;
+                    out_effective_cycle_us = apply_varmax(varmax_cycle);
                     return "autofix-varmax-override";
                 }
             }
@@ -1091,7 +1372,7 @@ static const char* apply_transfer_mode(Sync& sb,
                 sb.configTransferVarAuto(cycle);
                 return is_dsd ? "autofix-varauto-dsd" : "autofix-varauto";
             } else {
-                sb.configTransferVarMax(cycle);
+                out_effective_cycle_us = apply_varmax(cycle_us);
                 return "autofix-varmax";
             }
         }
@@ -1131,8 +1412,7 @@ static const char* apply_transfer_mode(Sync& sb,
                             "%uHz/%ubit/%uch; falling back to varmax",
                          cycle_us, varmax_cycle, safe_max,
                          sample_rate, bits_per_sample, channels);
-                    sb.configTransferVarMax(Clock::MicroSeconds(varmax_cycle));
-                    out_effective_cycle_us = varmax_cycle;
+                    out_effective_cycle_us = apply_varmax(varmax_cycle);
                     return "auto-varmax-override";
                 }
             }
@@ -1145,7 +1425,7 @@ static const char* apply_transfer_mode(Sync& sb,
                 sb.configTransferVarAuto(cycle);
                 return is_dsd ? "auto-varauto-dsd" : "auto-varauto";
             } else {
-                sb.configTransferVarMax(cycle);
+                out_effective_cycle_us = apply_varmax(cycle_us);
                 return "auto-varmax";
             }
         }
@@ -1608,18 +1888,20 @@ static uint32_t open_sync_worker_blocking(scream_diretta::ScreamDirettaSync*& ou
     }
     dbg_event("sdk_sync_open_return", "result=ok");
 
-    const uint32_t mtu_eff = cfg.mtu_override > 0 ? (uint32_t)cfg.mtu_override : g_st.mtu;
+    const uint32_t path_mtu = cfg.mtu_override > 0
+        ? (uint32_t)cfg.mtu_override
+        : (g_st.path_mtu > 0 ? g_st.path_mtu : g_st.mtu);
     phase_event("setSink_begin",
                 "addr=%s buffer_ms=0 mtu=%u",
-                ip_to_str(g_st.sink_addr).c_str(), (unsigned)mtu_eff);
+                ip_to_str(g_st.sink_addr).c_str(), (unsigned)path_mtu);
     dbg_event("setSink_begin",
               "addr=%s buffer_ms=0 mtu=%u nopBreak=false",
               ip_to_str(g_st.sink_addr).c_str(),
-              (unsigned)mtu_eff);
+              (unsigned)path_mtu);
     if (!sync->setSink(g_st.sink_addr,
                        Clock(),  // 0 = SDK / Target default sink buffer time
                        /*nopBreak*/ false,
-                       mtu_eff)) {
+                       path_mtu)) {
         DLOG(0, "setSink() failed");
         phase_event("setSink_end", "result=fail");
         dbg_event("setSink_return", "result=fail");
@@ -1633,6 +1915,28 @@ static uint32_t open_sync_worker_blocking(scream_diretta::ScreamDirettaSync*& ou
     // misses the first cycles and produces no audio. Mirrors DRUP /
     // slim2Diretta inter-call pauses.
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    sync->inquirySupportFormat(g_st.sink_addr);
+    {
+        const Sync::Info& si = sync->getSinkInfo();
+        const uint32_t active_mtu = resolve_active_mtu(*sync, path_mtu);
+        DLOG(1, "MTU resolve: path=%u sink req=%u max=%u -> active=%u",
+             (unsigned)path_mtu, (unsigned)si.reqMTU, (unsigned)si.maxMTU,
+             (unsigned)active_mtu);
+        if (active_mtu > 0 && active_mtu != path_mtu) {
+            if (!sync->setSink(g_st.sink_addr, Clock(), false, active_mtu)) {
+                DLOG(0, "setSink() with active MTU %u failed; keeping path MTU %u",
+                     (unsigned)active_mtu, (unsigned)path_mtu);
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+        }
+        if (active_mtu > 0) g_st.mtu = active_mtu;
+        g_st.inferred_overhead = load_inferred_overhead(g_st.sink_addr, g_st.mtu);
+    }
+    if (g_st.inferred_overhead < 0) {
+        calibrate_overhead_if_missing(*sync, g_st.mtu);
+    }
 
     // Format negotiation: PCM falls back to lower bit depths; DSD tries
     // the four common LSB/MSB × BIG/LITTLE combinations.
@@ -1807,9 +2111,9 @@ static uint32_t open_sync_worker_blocking(scream_diretta::ScreamDirettaSync*& ou
     // first successful open. Cache location is resolved by overhead_cache_dir():
     // $STATE_DIRECTORY (systemd) → $HOME/.config/scream2diretta → /tmp.
     {
-        const uint32_t eff_mtu = cfg.mtu_override > 0
-            ? (uint32_t)cfg.mtu_override
-            : g_st.mtu;
+        const uint32_t eff_mtu = g_st.mtu > 0
+            ? g_st.mtu
+            : (cfg.mtu_override > 0 ? (uint32_t)cfg.mtu_override : 0);
         // target_cycle = the cycle we actually handed to the SDK (returned via
         // out-param from apply_transfer_mode). This stays correct across all
         // AUTO sub-branches (varmax-override, fixauto, etc.) where the cycle
@@ -1817,7 +2121,7 @@ static uint32_t open_sync_worker_blocking(scream_diretta::ScreamDirettaSync*& ou
         const int target_cycle = static_cast<int>(applied_cycle_us);
         const long long sdk_cycle = (long long)(sync->getCycleTime().getMicroSeconds());
 
-        if (verbosity >= 2) {
+        if (verbosity >= 1) {
             // mode_sdk: the send-profile ModeType the SDK quantized our config
             // into (read-back of getMode()). Maps Profile::ModeType:
             //   VARIABLE=0, FIX=1, RANDOM=2, TRIANGOLO=3.
@@ -1842,7 +2146,7 @@ static uint32_t open_sync_worker_blocking(scream_diretta::ScreamDirettaSync*& ou
             } else {
                 min_cycle_buf[0] = '\0';
             }
-            DLOG(2, "transfer: mtu=%u mode=%s mode_sdk=%s target_cycle=%dus "
+            DLOG(1, "transfer: mtu=%u mode=%s mode_sdk=%s target_cycle=%dus "
                  "sdk_cycle=%lldus cycle_size=%zuB cycle_packets=%zu%s",
                  (unsigned)eff_mtu, applied_mode, mode_sdk, target_cycle, sdk_cycle,
                  (size_t)sync->getCycleSize(),
@@ -1853,21 +2157,19 @@ static uint32_t open_sync_worker_blocking(scream_diretta::ScreamDirettaSync*& ou
         g_st.target_cycle_us = static_cast<uint64_t>(target_cycle);
         g_st.sdk_cycle_us = static_cast<uint64_t>(sdk_cycle);
 
-        // Infer actual protocol overhead from SDK feedback.
-        // cycle_size is the per-packet PCM payload; eff_mtu - cycle_size
-        // equals the real overhead (Ethernet + DDS + FCS + padding).
-        if (g_st.inferred_overhead < 0) {
+        // Tighten the (target, MTU) leftover if this 1-packet profile is
+        // smaller than the cached value (e.g. 24-bit after a 16-bit-only
+        // calibrate). Never store a 2-packet leftover.
+        {
             const size_t cs = sync->getCycleSize();
+            const size_t packets = sync->getCyclePackets();
             const int inferred = static_cast<int>(eff_mtu) - static_cast<int>(cs);
-            if (inferred > 0 && inferred < 200) {
+            if (packets == 1 && inferred > 0 && inferred < 200 &&
+                (g_st.inferred_overhead < 0 || inferred < g_st.inferred_overhead)) {
                 g_st.inferred_overhead = inferred;
                 DLOG(1, "inferred overhead: %d (mtu=%u cycle_size=%zu packets=%zu)",
-                     inferred, (unsigned)eff_mtu, cs,
-                     (size_t)sync->getCyclePackets());
-                save_inferred_overhead(g_st.sink_addr, inferred);
-            } else {
-                DLOG(1, "overhead inference skipped: mtu=%u cycle_size=%zu "
-                     "raw_inferred=%d", (unsigned)eff_mtu, cs, inferred);
+                     inferred, (unsigned)eff_mtu, cs, packets);
+                save_inferred_overhead(g_st.sink_addr, eff_mtu, inferred);
             }
         }
     }
@@ -2408,14 +2710,15 @@ static bool reconfigure(const receiver_format_t& rf) {
     g_st.last_cooldown_ms = cooldown_ms;
 
     if (df.is_dsd) {
-        DLOG(1, "format change accepted: DSD (real_rate=%u Hz, mult=%u) container=%u Hz, %u-bit, %u ch (bpf=%u) "
-             "[first_open=%d cooldown_ms=%d]",
-             df.dsd_real_rate, df.dsd_multiplier,
-             rate, bits, ch, dst_bpf, is_first_open ? 1 : 0, cooldown_ms);
+        DLOG(0, "format: DSD (real_rate=%u Hz, mult=%u) container=%u Hz, %u-bit, %u ch",
+             df.dsd_real_rate, df.dsd_multiplier, rate, bits, ch);
+        DLOG(1, "format change accepted: DSD bpf=%u [first_open=%d cooldown_ms=%d]",
+             dst_bpf, is_first_open ? 1 : 0, cooldown_ms);
     } else {
-        DLOG(1, "format change accepted: %u Hz, %u-bit, %u ch (src_bpf=%u dst_bpf=%u pack24=%d) "
+        DLOG(0, "format: %u Hz / %u-bit / %u ch", rate, bits, ch);
+        DLOG(1, "format change accepted: src_bpf=%u dst_bpf=%u pack24=%d "
              "[first_open=%d cooldown_ms=%d]",
-             rate, bits, ch, src_bpf, dst_bpf, df.pcm_needs_pack_24 ? 1 : 0,
+             src_bpf, dst_bpf, df.pcm_needs_pack_24 ? 1 : 0,
              is_first_open ? 1 : 0, cooldown_ms);
     }
     // Reset the global phase-trace anchor so every event after this point
@@ -2560,10 +2863,16 @@ static bool try_reconnect_same_format(const char* reason) {
              inflight, reason ? reason : "sink lost");
     }
     g_st.reconnect_attempts.fetch_add(1, std::memory_order_relaxed);
-    DLOG(0, "reconnecting to sink (attempt %llu, reason=%s, format=%u Hz, %u-bit, %u ch) "
+    const unsigned long long attempt =
+        (unsigned long long)g_st.reconnect_attempts.load(std::memory_order_relaxed);
+    const char* why = reason ? reason : "sink lost";
+    const bool noteworthy = (attempt > 1) ||
+        (std::strstr(why, "lost") != nullptr) ||
+        (std::strstr(why, "fail") != nullptr);
+    DLOG(noteworthy ? 0 : 1,
+         "reconnecting to sink (attempt %llu, reason=%s, format=%u Hz, %u-bit, %u ch) "
          "[non-blocking — receive thread continues ingestion]",
-         (unsigned long long)g_st.reconnect_attempts.load(std::memory_order_relaxed),
-         reason ? reason : "sink lost",
+         attempt, why,
          g_st.sample_rate, g_st.bits_per_sample, g_st.channels);
     if (!start_async_sync_open(g_st.last_fc, reason)) {
         return false;
@@ -2683,22 +2992,21 @@ static void poll_underrun_events() {
         if (bps > 0) rebuf_target_ms = (static_cast<uint64_t>(rebuf_target) * 1000ULL) / bps;
         const bool producer_active = g_st.was_active_last_period;
 
-        std::fprintf(stderr,
-            "[diretta] underrun_begin: episode=%llu fill=%zu/%zu B "
-            "(~%llu/%llu ms) source_gap_ms=%lld nic_gap_ms=%lld producer=%s "
-            "stream_count=%llu real_cycles=%llu silent_cycles=%llu "
-            "rebuffer_target=%zu B (~%llu ms)\n",
-            (unsigned long long)cur_events,
-            fill, cap,
-            (unsigned long long)fill_ms,
-            (unsigned long long)cap_ms,
-            source_gap_ms,
-            nic_gap_ms,
-            producer_active ? "active" : "idle",
-            (unsigned long long)g_st.sync->getStreamCount(),
-            (unsigned long long)g_st.underrun_begin_real_cycles,
-            (unsigned long long)g_st.underrun_begin_silent_cycles,
-            rebuf_target, (unsigned long long)rebuf_target_ms);
+        DLOG(0, "underrun_begin: episode=%llu fill=%zu/%zu B "
+             "(~%llu/%llu ms) source_gap_ms=%lld nic_gap_ms=%lld producer=%s "
+             "stream_count=%llu real_cycles=%llu silent_cycles=%llu "
+             "rebuffer_target=%zu B (~%llu ms)",
+             (unsigned long long)cur_events,
+             fill, cap,
+             (unsigned long long)fill_ms,
+             (unsigned long long)cap_ms,
+             source_gap_ms,
+             nic_gap_ms,
+             producer_active ? "active" : "idle",
+             (unsigned long long)g_st.sync->getStreamCount(),
+             (unsigned long long)g_st.underrun_begin_real_cycles,
+             (unsigned long long)g_st.underrun_begin_silent_cycles,
+             rebuf_target, (unsigned long long)rebuf_target_ms);
         phase_event("underrun_begin",
                     "episode=%llu fill_ms=%llu source_gap_ms=%lld "
                     "nic_gap_ms=%lld producer=%s rebuffer_target_ms=%llu",
@@ -2738,16 +3046,15 @@ static void poll_underrun_events() {
                                        g_st.underrun_begin_silent_cycles;
         const uint64_t real_delta   = g_st.sync->realCycles() -
                                        g_st.underrun_begin_real_cycles;
-        std::fprintf(stderr,
-            "[diretta] underrun_recover: episode=%llu fill=%zu B "
-            "(~%llu ms) silent_ms=%lld source_gap_ms=%lld nic_gap_ms=%lld "
-            "producer=%s silent_cycles_delta=%llu real_cycles_delta=%llu\n",
-            (unsigned long long)cur_events,
-            fill, (unsigned long long)fill_ms,
-            silent_ms, source_gap_ms, nic_gap_ms,
-            g_st.was_active_last_period ? "active" : "idle",
-            (unsigned long long)silent_delta,
-            (unsigned long long)real_delta);
+        DLOG(0, "underrun_recover: episode=%llu fill=%zu B "
+             "(~%llu ms) silent_ms=%lld source_gap_ms=%lld nic_gap_ms=%lld "
+             "producer=%s silent_cycles_delta=%llu real_cycles_delta=%llu",
+             (unsigned long long)cur_events,
+             fill, (unsigned long long)fill_ms,
+             silent_ms, source_gap_ms, nic_gap_ms,
+             g_st.was_active_last_period ? "active" : "idle",
+             (unsigned long long)silent_delta,
+             (unsigned long long)real_delta);
         phase_event("underrun_recover",
                     "episode=%llu fill_ms=%llu silent_ms=%lld "
                     "source_gap_ms=%lld nic_gap_ms=%lld",
@@ -2786,7 +3093,7 @@ static void format_stats_line(const char* tag, char* out, size_t outlen) {
         fill_delta_ms = (long long)(((cur_fill_b - prev_fill_b) * 1000) / (long long)bps);
     }
     std::snprintf(out, outlen,
-        "[diretta] %s: pushed=%llu B / %llu fr | dropped=%llu B / %llu fr / %llu ms"
+        "%s: pushed=%llu B / %llu fr | dropped=%llu B / %llu fr / %llu ms"
         " | partial_carry=%llu | fmt_changes=%llu | underruns=%llu (events=%llu)"
         " | fill=%llu/%llu B (~%llu ms) | cycles real=%llu silent=%llu"
         " | push_delta_ms=%lld drain_delta_ms=%lld net_fill_delta_ms=%lld "
@@ -2816,7 +3123,7 @@ static void format_stats_line(const char* tag, char* out, size_t outlen) {
 }
 
 static void maybe_print_periodic_stats() {
-    if (!g_st.stats_print_armed) return;
+    if (!g_st.stats_print_armed || !stats_should_print()) return;
     auto now = std::chrono::steady_clock::now();
     if (now < g_st.next_stats_print) return;
 
@@ -2853,7 +3160,7 @@ static void maybe_print_periodic_stats() {
 
     char line[512];
     format_stats_line(tag, line, sizeof(line));
-    std::fprintf(stderr, "%s\n", line);
+    emit_log(stderr, LogHi::Stats, "diretta", line);
 
     g_st.last_stats_pushed_frames = s_now.pushed_frames;
     g_st.was_active_last_period   = active;
@@ -2904,11 +3211,12 @@ extern "C" int diretta_apply_cpu_affinity(int core) {
     CPU_ZERO(&cpuset);
     CPU_SET(core, &cpuset);
     if (pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset) != 0) {
-        std::cerr << "[diretta] WARNING: Failed to pin thread to CPU core "
-                  << core << " (errno=" << errno << ")" << std::endl;
+        std::fprintf(stderr,
+            "[diretta] WARNING: Failed to pin thread to CPU core %d (errno=%d)\n",
+            core, errno);
         return -1;
     }
-    std::cout << "[diretta] Thread pinned to CPU core " << core << std::endl;
+    DLOG(1, "Thread pinned to CPU core %d", core);
     return 0;
 #else
     (void)core;
@@ -2922,11 +3230,12 @@ extern "C" int diretta_apply_rt_priority(int priority) {
     struct sched_param param;
     param.sched_priority = priority;
     if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &param) != 0) {
-        std::cerr << "[diretta] WARNING: Failed to set SCHED_FIFO priority "
-                  << priority << " (errno=" << errno << ")" << std::endl;
+        std::fprintf(stderr,
+            "[diretta] WARNING: Failed to set SCHED_FIFO priority %d (errno=%d)\n",
+            priority, errno);
         return -1;
     }
-    std::cout << "[diretta] Thread set to SCHED_FIFO priority " << priority << std::endl;
+    DLOG(1, "Thread set to SCHED_FIFO priority %d", priority);
     return 0;
 #else
     (void)priority;
@@ -2971,6 +3280,9 @@ extern "C" void diretta_config_init(diretta_config_t *cfg) {
     cfg->stats_interval_sec = 5;
     cfg->stats_enabled = 0;
     cfg->log_level = DIRETTA_LOG_DEFAULT;
+    cfg->log_color = 1; /* always: systemd file logs are not a TTY */
+    cfg->diretta_debug = 0;
+    cfg->target_info_path = nullptr;
     // Compatibility packet capacity. The current hot path uses PcmRing.
     // packets at ~1152 bytes payload covers ~50..150 ms depending on the
     // active format and the wire packet rate; deep enough to ride out a
@@ -2979,7 +3291,6 @@ extern "C" void diretta_config_init(diretta_config_t *cfg) {
     // the actual socket option is applied in init_network(). Default is
     // 4 MiB (set in main() when the backend is Diretta).
     cfg->udp_rcvbuf_bytes = 0;
-    cfg->diretta_debug = 0;
     // PCM dump diagnostics. Both prefixes default to NULL (disabled);
     // the CLI sets them when --dump-ingress-wav / --dump-egress-wav is
     // passed. dump_ms is the per-file cap; default 0 = uncapped (the CLI
@@ -3095,13 +3406,9 @@ extern "C" int diretta_output_init(const diretta_config_t *cfg) {
     init_syslog(g_st.cfg);
 
     if (g_st.cfg.diretta_debug) {
-        // Announce the debug subsystem up front. SDK debug output still
-        // depends on whether a -nolog SDK archive was linked.
         std::fprintf(stderr,
-            "[diretta-debug] enabled; sdk_debug=yes; sdk_syslog=stdout; "
-            "phase_trace=yes; anchor=format_change_accepted "
-            "(and sync_open_begin); events on stderr with [diretta-debug] "
-            "prefix; Host SDK SysLog (info rcv / FEEDBACK) on stdout\n");
+            "[diretta-debug] enabled; s2d Sync/Target process trace on stderr "
+            "([diretta-debug] +Nms). Host SDK info rcv is --target-info, not this flag.\n");
     }
 
     Find::Setting fset;
@@ -3136,23 +3443,26 @@ extern "C" int diretta_output_init(const diretta_config_t *cfg) {
 
     g_st.sink_addr = targets[pick].portAddr;
 
-    // Load cached inferred overhead for this target, if available.
-    g_st.inferred_overhead = load_inferred_overhead(g_st.sink_addr);
-    if (g_st.inferred_overhead > 0) {
-        DLOG(1, "loaded cached overhead: %d for %s",
-             g_st.inferred_overhead, ip_to_str(g_st.sink_addr).c_str());
-    }
-
     if (g_st.cfg.mtu_override > 0) {
-        g_st.mtu = (uint32_t)g_st.cfg.mtu_override;
+        g_st.path_mtu = (uint32_t)g_st.cfg.mtu_override;
     } else {
-        if (!g_st.finder->measSendMTU(g_st.sink_addr, g_st.mtu)) {
+        if (!g_st.finder->measSendMTU(g_st.sink_addr, g_st.path_mtu)) {
             std::fprintf(stderr, "[diretta] MTU measurement failed\n");
             cleanup_finder();
             return 1;
         }
     }
-    DLOG(1, "selected target #%zu, MTU=%u", pick + 1, g_st.mtu);
+    g_st.mtu = g_st.path_mtu;
+    g_st.inferred_overhead = load_inferred_overhead(g_st.sink_addr, g_st.mtu);
+    if (g_st.inferred_overhead > 0) {
+        DLOG(1, "loaded cached overhead: %d for %s mtu=%u (path; sink req may differ at open)",
+             g_st.inferred_overhead, ip_to_str(g_st.sink_addr).c_str(),
+             (unsigned)g_st.mtu);
+    } else {
+        DLOG(1, "no overhead cache for %s path_mtu=%u; will resolve sink MTU and calibrate on first Sync open",
+             ip_to_str(g_st.sink_addr).c_str(), (unsigned)g_st.path_mtu);
+    }
+    DLOG(0, "ready: target #%zu  path_mtu=%u", pick + 1, g_st.path_mtu);
     if (g_st.cfg.diretta_debug) {
         const Find::TargetConnectInfo& ti = targets[pick].info;
         std::string tname = ti.targetName.empty() ? std::string("<unnamed>") : ti.targetName;
@@ -3166,11 +3476,13 @@ extern "C" int diretta_output_init(const diretta_config_t *cfg) {
             (unsigned)ti.PI, (unsigned)ti.PO, (unsigned)ti.version,
             ti.multiport ? 1 : 0, (unsigned)g_st.mtu);
     }
-    std::fprintf(stderr,
-        "[pipeline] SO_RCVBUF -> receiver_data_t -> diretta_output_send() "
-        "-> PcmRing -> getNewStream() -> Diretta SDK. Sync open is non-blocking; "
-        "the receiver keeps pushing PCM into PcmRing while SDK open / setSink / "
-        "connectWait / play runs on a worker thread.\n");
+    if (verbosity >= 2) {
+        std::fprintf(stderr,
+            "[pipeline] SO_RCVBUF -> receiver_data_t -> diretta_output_send() "
+            "-> PcmRing -> getNewStream() -> Diretta SDK. Sync open is non-blocking; "
+            "the receiver keeps pushing PCM into PcmRing while SDK open / setSink / "
+            "connectWait / play runs on a worker thread.\n");
+    }
     // Diretta-facing config summary. Only the knobs passed to the SDK.
     {
         const char* tmode_name = "auto";
@@ -3182,30 +3494,26 @@ extern "C" int diretta_output_init(const diretta_config_t *cfg) {
             case DIRETTA_TM_RANDOM:  tmode_name = "random"; break;
             case DIRETTA_TM_AUTOFIX: tmode_name = "autofix"; break;
         }
-        std::fprintf(stderr,
-            "[diretta] SDK config: thread_mode=0x%x cycle_time_us=%d "
-            "cycle_min_time_us=%d info_cycle_us=%d transfer_mode=%s "
-            "target_profile_limit_us=%d mtu_override=%d\n",
-            g_st.cfg.thread_mode != 0 ? g_st.cfg.thread_mode : 1u,
-            g_st.cfg.cycle_us, g_st.cfg.cycle_min_us,
-            g_st.cfg.info_cycle_us, tmode_name,
-            g_st.cfg.target_profile_limit_us,
-            g_st.cfg.mtu_override);
+        DLOG(1, "SDK config: thread_mode=0x%x cycle_time_us=%d "
+             "cycle_min_time_us=%d info_cycle_us=%d transfer_mode=%s "
+             "target_profile_limit_us=%d mtu_override=%d",
+             g_st.cfg.thread_mode != 0 ? g_st.cfg.thread_mode : 1u,
+             g_st.cfg.cycle_us, g_st.cfg.cycle_min_us,
+             g_st.cfg.info_cycle_us, tmode_name,
+             g_st.cfg.target_profile_limit_us,
+             g_st.cfg.mtu_override);
     }
-    // Pipeline / queue config. Not passed to the SDK; controls the receiver
-    // side of the unified queue and open sequencing.
-    std::fprintf(stderr,
-        "[pipeline] config: pcm_buffer_ms=%d pcm_prefill_ms=%d "
-        "rebuffer_percent=%.0f%% format_change_cooldown_ms=%d "
-        "udp_rcvbuf_bytes=%d upstream_idle_timeout_sec=%d (0=disabled) "
-        "upstream_pause_timeout_sec=%d (0=disabled)\n",
-        g_st.cfg.ring_buffer_ms > 0 ? g_st.cfg.ring_buffer_ms : 1000,
-        g_st.cfg.prefill_ms > 0 ? g_st.cfg.prefill_ms : 500,
-        g_st.cfg.rebuffer_percent * 100.0f,
-        effective_cooldown_ms(),
-        g_st.cfg.udp_rcvbuf_bytes,
-        g_st.cfg.upstream_idle_timeout_sec,
-        g_st.cfg.upstream_pause_timeout_sec);
+    DLOG(1, "pipeline config: pcm_buffer_ms=%d pcm_prefill_ms=%d "
+         "rebuffer_percent=%.0f%% format_change_cooldown_ms=%d "
+         "udp_rcvbuf_bytes=%d upstream_idle_timeout_sec=%d (0=disabled) "
+         "upstream_pause_timeout_sec=%d (0=disabled)",
+         g_st.cfg.ring_buffer_ms > 0 ? g_st.cfg.ring_buffer_ms : 1000,
+         g_st.cfg.prefill_ms > 0 ? g_st.cfg.prefill_ms : 500,
+         g_st.cfg.rebuffer_percent * 100.0f,
+         effective_cooldown_ms(),
+         g_st.cfg.udp_rcvbuf_bytes,
+         g_st.cfg.upstream_idle_timeout_sec,
+         g_st.cfg.upstream_pause_timeout_sec);
 
     // Warn if PcmRing is too small to absorb the format-change cooldown plus
     // expected SDK open latency. This gives the user a startup warning rather
@@ -3215,16 +3523,15 @@ extern "C" int diretta_output_init(const diretta_config_t *cfg) {
         const int total_budget_ms = effective_cooldown_ms() + expected_open_ms;
         const int ring_ms = g_st.cfg.ring_buffer_ms > 0 ? g_st.cfg.ring_buffer_ms : 1000;
         if (total_budget_ms > ring_ms) {
-            std::fprintf(stderr,
-                "[diretta] WARN: PcmRing (--pcm-buffer-ms %d) is smaller "
-                "than format_change_cooldown_ms(%d) + expected_open_ms(%d) = "
-                "%d ms. On a format change PcmRing may overflow "
-                "before the SDK begins pulling, causing audible drops. "
-                "Consider --pcm-buffer-ms %d or --format-change-cooldown-ms %d.\n",
-                ring_ms, effective_cooldown_ms(), expected_open_ms,
-                total_budget_ms,
-                total_budget_ms + 200,
-                ring_ms - expected_open_ms > 0 ? ring_ms - expected_open_ms : 100);
+            DLOG(0, "WARN: PcmRing (--pcm-buffer-ms %d) is smaller "
+                 "than format_change_cooldown_ms(%d) + expected_open_ms(%d) = "
+                 "%d ms. On a format change PcmRing may overflow "
+                 "before the SDK begins pulling, causing audible drops. "
+                 "Consider --pcm-buffer-ms %d or --format-change-cooldown-ms %d.",
+                 ring_ms, effective_cooldown_ms(), expected_open_ms,
+                 total_budget_ms,
+                 total_budget_ms + 200,
+                 ring_ms - expected_open_ms > 0 ? ring_ms - expected_open_ms : 100);
         } else {
             DLOG(1, "PcmRing budget check: pcm_buffer_ms=%d covers "
                  "cooldown(%d)+expected_open(%d)=%d ms (headroom=%d ms)",
@@ -3389,7 +3696,7 @@ extern "C" int diretta_output_init(const diretta_config_t *cfg) {
 
     g_st.sdk_open = true;
     g_st.initialized = true;
-    g_st.stats_print_armed = true;
+    g_st.stats_print_armed = stats_should_print();
     return 0;
     } catch (...) {
         std::fprintf(stderr,
@@ -3854,7 +4161,8 @@ extern "C" int diretta_output_send(receiver_data_t *data) {
             // no longer applicable for this open. Reset so subsequent
             // format-change reopens get their own one-shot check.
             g_st.startup_overflow_risk_logged = false;
-            DLOG(1, "first real PCM output (queue_fill=%zu B, ~%llu ms)",
+            DLOG(0, "playing: %u Hz / %u-bit / %u ch  fill=%zu B (~%llu ms)",
+                 g_st.sample_rate, g_st.bits_per_sample, g_st.channels,
                  g_st.sync->ringFill(),
                  (unsigned long long)g_st.sync->ringFillMs());
             phase_event("first_real_pcm",
@@ -4165,7 +4473,7 @@ extern "C" int diretta_get_stats(diretta_stats_t *out) {
 extern "C" void diretta_print_stats(const char *tag) {
     char line[512];
     format_stats_line(tag ? tag : "stats", line, sizeof(line));
-    std::fprintf(stderr, "%s\n", line);
+    emit_log(stderr, LogHi::Stats, "diretta", line);
 }
 
 extern "C" void diretta_output_shutdown(void) {
@@ -4227,4 +4535,5 @@ extern "C" void diretta_output_shutdown(void) {
     g_st.sdk_open = false;
     g_st.initialized = false;
     g_st.stats_print_armed = false;
+    close_target_info_log();
 }

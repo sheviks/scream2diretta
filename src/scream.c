@@ -163,16 +163,27 @@ static void show_usage(const char *arg0)
   fprintf(stderr, "                               LimitMEMLOCK=infinity); failure is non-fatal.\n");
   fprintf(stderr, "\n");
   fprintf(stderr, "Stats:\n");
-  fprintf(stderr, "  --stats-interval <sec>       Periodic producer-side stats every <sec> seconds (default 0=off).\n");
-  fprintf(stderr, "                               Active when --verbose or --stats is set; rate-limited and run\n");
-  fprintf(stderr, "                               from the receiver thread (never on the audio hot path).\n");
-  fprintf(stderr, "  --stats                      Force stats printing even without --verbose.\n");
+  fprintf(stderr, "  --stats-interval <sec>       Periodic stats period in seconds (default 5).\n");
+  fprintf(stderr, "                               Printed only with -v/-vv or --stats. 0 = every call (noisy).\n");
+  fprintf(stderr, "  --stats                      Force stats printing even without -v.\n");
   fprintf(stderr, "\n");
-  fprintf(stderr, "Logging:\n");
-  fprintf(stderr, "  --verbose, -v                Verbose s2d output (format, open, stats). Repeat for -vv.\n");
-  fprintf(stderr, "  --quiet,   -q                Quiet -- only errors and warnings.\n");
-  fprintf(stderr, "  --diretta-debug              SDK phase trace plus Host SDK syslog on stderr\n");
-  fprintf(stderr, "                               ([sdk] info rcv / FEEDBACK every InfoCycle; default off).\n");
+  fprintf(stderr, "Logging (four independent streams):\n");
+  fprintf(stderr, "  (default)                    State changes only: ready, format, playing,\n");
+  fprintf(stderr, "                               reconnect-after-loss, idle release, underrun, errors.\n");
+  fprintf(stderr, "  --verbose, -v                Per-open summary: transfer profile, ring, play, MS mode,\n");
+  fprintf(stderr, "                               plus periodic stats.\n");
+  fprintf(stderr, "  -vv                          Per-open timeline: [diretta-phase] handshake, open-gate\n");
+  fprintf(stderr, "                               wait, sink caps, prefill, grace.\n");
+  fprintf(stderr, "  --diretta-debug              s2d Sync/Target process trace ([diretta-debug] +Nms).\n");
+  fprintf(stderr, "                               Does not dump Host SDK info rcv. Independent of -v/-vv.\n");
+  fprintf(stderr, "  --target-info [path]         Host SDK / Target Info syslog ([sdk] info rcv / FEEDBACK).\n");
+  fprintf(stderr, "                               No path: /var/log/s2d-target.log. '-' = stderr.\n");
+  fprintf(stderr, "                               Independent of -v/-vv/--diretta-debug.\n");
+  fprintf(stderr, "  --color auto|always|never    Color + * / ! / ~ markers (default always, so\n");
+  fprintf(stderr, "                               tail -f of the systemd log file shows color).\n");
+  fprintf(stderr, "                               auto = TTY only; never / NO_COLOR = no ANSI.\n");
+  fprintf(stderr, "                               * key (playing/format/transfer)  ! warn/underrun  ~ stats.\n");
+  fprintf(stderr, "  --quiet,   -q                Host SDK syslog floor Warning (does not hide s2d errors).\n");
   fprintf(stderr, "  --help,    -h                Show this help and exit.\n");
   fprintf(stderr, "  --version                   Show version and exit.\n");
   fprintf(stderr, "\n");
@@ -255,6 +266,8 @@ enum {
   OPT_STATS_INTERVAL,
   OPT_STATS,
   OPT_DIRETTA_DEBUG,
+  OPT_TARGET_INFO,
+  OPT_COLOR,
   OPT_FORMAT_CHANGE_COOLDOWN_MS,
   OPT_UPSTREAM_IDLE_TIMEOUT_SEC,
   OPT_UPSTREAM_PAUSE_TIMEOUT_SEC,
@@ -305,6 +318,8 @@ static const struct option long_options[] = {
   { "stats-interval",       required_argument, 0, OPT_STATS_INTERVAL },
   { "stats",                no_argument,       0, OPT_STATS },
   { "diretta-debug",        no_argument,       0, OPT_DIRETTA_DEBUG },
+  { "target-info",          optional_argument, 0, OPT_TARGET_INFO },
+  { "color",                required_argument, 0, OPT_COLOR },
   { "format-change-cooldown-ms", required_argument, 0, OPT_FORMAT_CHANGE_COOLDOWN_MS },
   { "upstream-idle-timeout-sec", required_argument, 0, OPT_UPSTREAM_IDLE_TIMEOUT_SEC },
   { "upstream-pause-timeout-sec", required_argument, 0, OPT_UPSTREAM_PAUSE_TIMEOUT_SEC },
@@ -650,6 +665,28 @@ int main(int argc, char*argv[]) {
     case OPT_DIRETTA_DEBUG:
       dcfg.diretta_debug = 1;
       break;
+    case OPT_TARGET_INFO: {
+      const char *p = optarg;
+      /* GNU optional_argument only fills optarg for --target-info=PATH.
+       * Also accept a following token that is not another flag. */
+      if (!p && optind < argc && argv[optind][0] != '-') {
+        p = argv[optind++];
+      }
+      if (!p || p[0] == '\0') {
+        p = DIRETTA_DEFAULT_TARGET_INFO_PATH;
+      }
+      dcfg.target_info_path = p;
+      break;
+    }
+    case OPT_COLOR:
+      if (strcmp(optarg, "auto") == 0) dcfg.log_color = 0;
+      else if (strcmp(optarg, "always") == 0) dcfg.log_color = 1;
+      else if (strcmp(optarg, "never") == 0) dcfg.log_color = 2;
+      else {
+        fprintf(stderr, "--color must be auto, always, or never\n");
+        return 1;
+      }
+      break;
     case OPT_FORMAT_CHANGE_COOLDOWN_MS: {
       int v = atoi(optarg);
       if (v < 0 || v > 5000) {
@@ -782,6 +819,8 @@ int main(int argc, char*argv[]) {
     case OPT_STATS_INTERVAL:
     case OPT_STATS:
     case OPT_DIRETTA_DEBUG:
+    case OPT_TARGET_INFO:
+    case OPT_COLOR:
     case OPT_FORMAT_CHANGE_COOLDOWN_MS:
     case OPT_UPSTREAM_IDLE_TIMEOUT_SEC:
     case OPT_UPSTREAM_PAUSE_TIMEOUT_SEC:
@@ -812,8 +851,8 @@ int main(int argc, char*argv[]) {
   }
 
 #if DIRETTA_ENABLE
-  // Host SDK SysLog Debug (info rcv / FEEDBACK, formerly UDP 19640) is
-  // --diretta-debug only. -v/-vv only raise s2d's own DLOG / phase lines.
+  // Host SDK SysLog Debug (info rcv / FEEDBACK) is --target-info only.
+  // --diretta-debug is the s2d process trace. -v/-vv only raise DLOG / phase.
   if (quiet) dcfg.log_level = DIRETTA_LOG_WARN;
   else dcfg.log_level = DIRETTA_LOG_DEFAULT;
 

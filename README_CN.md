@@ -216,7 +216,7 @@ sudo ./scream2diretta --list-targets
 sudo ./scream2diretta
 
 # 绑定目标 #1，单播端口 4010，每 5 秒显示详细统计
-sudo ./scream2diretta -t 1 -p 4010 -vv --stats --stats-interval 5
+sudo ./scream2diretta -t 1 -p 4010 -v
 
 # 使用 CPU 亲和性（推荐用于最佳音质）
 sudo ./scream2diretta -t 1 -p 4010 \
@@ -244,8 +244,32 @@ sudo ./scream2diretta -t 1 -p 4010 \
 | `--cpu-scream <core>` | — | 将接收线程绑定到指定核心 |
 | `--cpu-audio <core>` | — | 将 SDK 工作线程绑定到指定核心 |
 | `--cpu-other <core>` | — | 将辅助线程绑定到指定核心 |
-| `--stats --stats-interval <sec>` | off | 周期性统计 |
-| `-v` / `-vv` | off | 详细 / 非常详细 |
+| `--stats --stats-interval <sec>` | 关 / 5s | 周期性统计（`--stats` 或 `-v`；间隔默认 5 秒） |
+| `-v` | 关 | 每次开流摘要（transfer profile、ring、play）加上 stats |
+| `-vv` | 关 | 开流握手时间线（`[diretta-phase]`） |
+| `--diretta-debug` | 关 | s2d Sync/Target 进程迹（`[diretta-debug] +Nms`） |
+| `--target-info [path]` | 关 | Host/Target Info syslog 写入 `path`（默认 `/var/log/s2d-target.log`；`-` = stderr） |
+| `--color <mode>` | always | `always` / `auto`（仅 TTY）/ `never`。`*`/`!`/`~` 行标 |
+
+### 日志
+
+四条流互相独立，不会因为开了一条就带上另一条：
+
+| 流 | 内容 |
+|----|------|
+| 默认（无 `-v`） | 只打状态变化：`ready`、`format`、`playing`、丢 Target 后重连、idle 释放、underrun、错误 |
+| `-v` | 每次开流摘要（`transfer:`、ring、play、MS mode）加上周期 `stats[...]` |
+| `-vv` | 握手时间线（`[diretta-phase] +N/+Mms`，事件名对齐） |
+| `--diretta-debug` | s2d Sync/Target 进程迹（`[diretta-debug]`）。**不会**倒 Host SDK 的 `info rcv` |
+| `--target-info [path]` | Host SDK syslog（`[sdk] info rcv` / `FEEDBACK` / `Stream Rest`）追加到 `path`。省略路径则为 `/var/log/s2d-target.log`；`-` 写 stderr（systemd 下即主 log） |
+
+s2d 行首有文件里也能用的标记：`*` 关键、`!` 警告/underrun、`~` stats。`--color` 默认 `always`，这样 `tail -f /var/log/scream2diretta.log` 能看到颜色（systemd append 不是 TTY）。`--color never` 或 `NO_COLOR=1` 关颜色，标记仍在。
+
+`--stats` 可在没有 `-v` 时仍打 5 秒 stats。`--stats-interval` 只改节拍。
+
+### Overhead 缓存
+
+第一次 Sync open（任意 transfer mode）会在 `connect`/`play` 之前用 VarMax 探测 44.1 kHz PCM 16/24/32-bit，取最小的 1-packet leftover 作为协议 overhead。文件名是 `overhead-<地址>-mtu<N>.txt`，目录为 `$STATE_DIRECTORY`（systemd：`/var/lib/scream2diretta`）或 `~/.config/scream2diretta`。`N` 是 **主动发送 MTU**（`min(路径 measSendMTU 或 --mtu, Target reqMTU 或 maxMTU)`），所以网卡 jumbo、Target 仍是 1500 时按 1500 校准。文件已存在则 idle 释放后重连不再探测。
 
 ### 传输模式
 
@@ -280,7 +304,7 @@ varmax_cycle x 0.97`（3% 裕度，用于吸收 overhead 推断抖动）比较�
 在 Target Profile 激活时（`--target-profile-limit > 0`），`autofix`
 等同 `fixauto`（`pm.configTransferFixAuto(cycle)`）。
 
-#### 读懂 `transfer:` 日志行（`-vv`）
+#### 读懂 `transfer:` 日志行（`-v`）
 
 ```
 transfer: mtu=1518 mode=auto-varauto-cycle mode_sdk=variable target_cycle=800us sdk_cycle=803us cycle_size=616B cycle_packets=1

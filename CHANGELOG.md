@@ -8,6 +8,41 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Split logging into four independent streams.** Default (no `-v`) is
+  state changes only (`ready`, `format`, `playing`, reconnect-after-loss,
+  idle release, underrun, errors). `-v` is the per-open summary including
+  the `transfer:` line and periodic stats. `-vv` is the `[diretta-phase]`
+  handshake timeline. `--diretta-debug` is the s2d `[diretta-debug] +Nms`
+  process trace and no longer attaches Host SDK `info rcv` to stderr.
+  `--target-info [path]` writes `[sdk]` Info/FEEDBACK to a file
+  (default `/var/log/s2d-target.log`; `-` = stderr).
+  Periodic `stats[...]` is no longer always-on; it requires `-v` or
+  `--stats`. (`diretta.cpp`, `scream.c`, `diretta_sync.cpp`)
+- **Scannable log lines.** A leading marker (`*` key, `!` warn/underrun,
+  `~` stats) is always written. `-vv` / `--diretta-debug` timestamps compact
+  to `+N/+Mms` with the event name in a fixed column. Color defaults to
+  **always** so `tail -f` of the systemd log file shows it (auto-by-TTY
+  would never fire under `StandardOutput=append=`). (`diretta.cpp`, `scream.c`)
+
+### Fixed
+
+- **VarMax one-packet invariant across bit depths.** `calculateCycleTime()`
+  now floors the MTU payload to a whole PCM/DSD frame before converting to
+  microseconds. A 24-bit-inferred overhead of 2 used to request 3822 bytes,
+  which is not divisible by 4, so 16-bit VarMax split into `cycle_packets=2`
+  and `getCycleTime()` roughly doubled. If VarMax still reports more than one
+  packet, s2d retries with a one-frame-smaller cycle. (`diretta.cpp`)
+- **Overhead cache is `(target, MTU)` and is calibrated when missing.**
+  First Sync open (any transfer mode) probes 44.1 kHz 16/24/32-bit via
+  `configTransferVarMax` before `connect`/`play`, stores the minimum 1-packet
+  leftover, and uses that as protocol overhead. Filename is
+  `overhead-<addr>-mtu<N>.txt`. The MTU used is **active send MTU**:
+  `min(measSendMTU/--mtu, Target reqMTU or maxMTU)`, not the path probe
+  alone — a jumbo NIC with Target still at 1500 calibrates against 1500.
+  (`diretta.cpp`)
+
 ---
 
 ## [0.8.0] - 2026-09-08

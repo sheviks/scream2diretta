@@ -78,6 +78,13 @@ control-plane / format-change work.
   real `getNewStream()` call so it lands on the actual SDK worker thread (the one
   pulling PCM), not the caller.
 
+### Logging
+
+- Default: state changes only (`ready` / `format` / `playing` / errors).
+- `-v`: per-open summary + stats. `-vv`: `[diretta-phase]` handshake timeline.
+- `--diretta-debug`: s2d process trace only. Host SDK `info rcv` is `--target-info`.
+- `--color` defaults to always (systemd log file is not a TTY).
+
 ## Hot Path Rules
 
 - No heap allocations in steady state.
