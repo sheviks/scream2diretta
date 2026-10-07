@@ -315,7 +315,9 @@ default) otherwise.
 
 `varprio` is **not** an alias of `fixauto`. It stays in the VARIABLE
 family (mostly fixed packet size, `VarSendRest` carries the frame remainder)
-and takes `--cycle-hz` rather than `--cycle-time`. See `docs/varprio-mode.md`.
+and takes `--cycle-hz` rather than `--cycle-time`. SDK 155 uses Hz so the
+44.1 kHz and 48 kHz families can share a grid (300 Hz divides both; 1/300 s
+is not an integer microsecond). See `docs/varprio-mode.md`.
 
 Under an active Target Profile (`--target-profile-limit > 0`), `autofix`
 is equivalent to `fixauto` (`pm.configTransferFixAuto(cycle)`); `varprio`

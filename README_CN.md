@@ -306,7 +306,8 @@ varmax_cycle x 0.97`（3% 裕度，用于吸收 overhead 推断抖动）比较�
 
 `varprio` **不是** `fixauto` 的别名。它仍在 VARIABLE 家族（包长基本固定，
 `VarSendRest` 摊整帧余数），参数是 `--cycle-hz` 而不是 `--cycle-time`。
-详见 `docs/varprio-mode.md`。
+155 用 Hz 是为了让 44.1 k / 48 k 两族能踩同一格（300 Hz 整除两边，
+\(1/300\) 秒却不是整数微秒）。逻辑与接线见 `docs/varprio-mode.md`。
 
 在 Target Profile 激活时（`--target-profile-limit > 0`），`autofix`
 等同 `fixauto`（`pm.configTransferFixAuto(cycle)`）；`varprio` 调用

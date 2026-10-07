@@ -6,7 +6,7 @@
 
 本文记录 `varmax` / `varauto` / `fixauto` / `varprio` 在 Target Profile 下的合同、`ModeType`、以及 `--target-info` 里 `cy=` / `fs=` 的算法。`auto` / `autofix` 是 s2d 自己的调度器，不在这四条里。
 
-`varprio` 的 CLI 接线和 `VarSendRest` 仍见 [varprio-mode.md](varprio-mode.md)。
+`varprio` 为什么用 Hz、要解决 44.1 k / 48 k 两族在整数微秒格子上踩不中 300 Hz 的问题，见 [varprio-mode.md](varprio-mode.md)。
 
 ---
 

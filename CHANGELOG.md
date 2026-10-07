@@ -14,8 +14,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `docs/transfer-profile-modes.md` records `varmax` / `varauto` /
   `fixauto` / `varprio` under `--target-profile-limit > 0` (`ModeType`,
   syslog `cy=` vs `fs=`, worked examples) and why `limit=200` often
-  matches SelfProfile geometry when the cap sits idle. (`README.md`,
-  `README_CN.md`, `docs/varprio-mode.md`)
+  matches SelfProfile geometry when the cap sits idle.
+- **Docs: why `varprio` is in Hz.** `docs/varprio-mode.md` records the
+  44.1 kHz / 48 kHz common grid (100 / 150 / 300 Hz), why `--cycle-time`
+  cannot express MemoryPlay's 300 Hz, and the 147-frame / 1176 B lock.
+  (`README.md`, `README_CN.md`)
 - **`--transfer-mode varprio --cycle-hz <Hz>` (Host SDK 155).** Calls
   `configTransferVarPrioTime` with integer Hz (100–3000) and does not
   fall back to VarMax/VarAuto. Oversized cycles are left to the SDK
