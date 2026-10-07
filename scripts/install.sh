@@ -138,15 +138,17 @@ detect_system() {
 }
 
 detect_latest_sdk() {
-    # Prefer SDK 150 when present (required for the statusUpdate/connectWait
-    # handshake). Otherwise take the highest DirettaHostSDK_* by version sort.
+    # Prefer 155 (varprio / SynchroSupport), then 150 (statusUpdate handshake).
+    # Otherwise take the highest DirettaHostSDK_* by version sort.
     local sdk_found=""
-    local loc
-    for loc in "$SCRIPT_DIR" "$SCRIPT_DIR/.." "$HOME" /opt /usr/local; do
-        if [ -d "$loc/DirettaHostSDK_150" ] && [ -d "$loc/DirettaHostSDK_150/lib" ]; then
-            echo "$(cd "$loc/DirettaHostSDK_150" && pwd)"
-            return
-        fi
+    local loc ver
+    for ver in 155 150; do
+        for loc in "$SCRIPT_DIR" "$SCRIPT_DIR/.." "$HOME" /opt /usr/local; do
+            if [ -d "$loc/DirettaHostSDK_$ver/lib" ]; then
+                echo "$(cd "$loc/DirettaHostSDK_$ver" && pwd)"
+                return
+            fi
+        done
     done
     sdk_found=$(find "$SCRIPT_DIR" "$SCRIPT_DIR/.." "$HOME" /opt /usr/local \
         -maxdepth 1 -type d -name 'DirettaHostSDK_*' 2>/dev/null | sort -V | tail -1 | xargs realpath 2>/dev/null)
@@ -198,7 +200,9 @@ check_diretta_sdk() {
             if [ -n "$sdk_version" ] && [ "$sdk_version" -lt 150 ] 2>/dev/null; then
                 print_warning "SDK $sdk_version is older than 150. connectWait() may stall ~50s"
                 print_warning "unless statusUpdate() chains to DIRETTA::Sync::statusUpdate()."
-                print_info "Extract DirettaHostSDK_150 next to the source tree and re-run."
+                print_info "Extract DirettaHostSDK_150 or _155 next to the source tree and re-run."
+            elif [ -n "$sdk_version" ] && [ "$sdk_version" -lt 155 ] 2>/dev/null; then
+                print_info "SDK $sdk_version: --transfer-mode varprio needs Host SDK 155+."
             fi
             return 0
         fi

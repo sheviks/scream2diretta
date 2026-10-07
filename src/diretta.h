@@ -51,6 +51,7 @@ typedef enum diretta_transfer_mode_e {
     DIRETTA_TM_FIXAUTO,     /* configTransferFixAuto */
     DIRETTA_TM_RANDOM,      /* configTransferRandom */
     DIRETTA_TM_AUTOFIX,     /* configTransferFixAuto when cycletime set, else auto B-branch */
+    DIRETTA_TM_VARPRIO,     /* SDK 155 configTransferVarPrioTime(Hz); needs --cycle-hz */
 } diretta_transfer_mode_t;
 
 #define DIRETTA_DEFAULT_TARGET_INFO_PATH "/var/log/s2d-target.log"
@@ -70,6 +71,7 @@ typedef struct diretta_config_s {
     /* Steady-state runtime tunables. */
     unsigned thread_mode;       /* SDK Sync::THRED_MODE bitmask, default 1=CRITICAL */
     int cycle_us;               /* target/max cycle in us. 0 = auto. range 333..10000 enforced */
+    int cycle_hz;               /* varprio only: configTransferVarPrioTime Hz. 0 = unset. 100..3000 */
     int cycle_min_us;           /* min cycle for random mode, 0 = auto */
     int info_cycle_us;          /* info packet cycle, default 100000 */
     diretta_transfer_mode_t transfer_mode;

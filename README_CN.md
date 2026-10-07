@@ -230,12 +230,14 @@ sudo ./scream2diretta -t 1 -p 4010 \
 |------|--------|------|
 | `--target, -t <index>` | 1 | 按 1-based 索引选择 Diretta 目标设备 |
 | `-L` | 关闭 | 使用原始 5 字节 Scream 头（legacy 模式）。ap2renderer、ASIOScream 以及旧版 scream-alsa 会发送字节交织的 DSD 和旧的 rate 编码，需要加此开关。 |
-| `--list-targets` | — | 发现并列出目标设备 |
+| `--list-targets` | — | 发现并列出目标（sink / Target 地址、路径/网卡 MTU、配置 URL、Synchro） |
 | `-p <port>` | 4010 | Scream UDP 端口 |
 | `-i <iface>` | — | 绑定到指定网络接口 |
 | `-g <group>` | 239.255.77.77 | 组播组地址（仅组播模式） |
 | `--thread-mode <mask>` | 1 (CRITICAL) | SDK 线程模式位掩码 |
-| `--transfer-mode <mode>` | auto | auto / varmax / varauto / fixauto / autofix / random（见[传输模式](#传输模式)） |
+| `--transfer-mode <mode>` | auto | auto / varmax / varauto / fixauto / autofix / random / varprio（见[传输模式](#传输模式)） |
+| `--cycle-time <us>` | auto | VarAuto / FixAuto / VarMax / Random 的目标周期（333–10000）。不要和 `varprio` 一起用。 |
+| `--cycle-hz <Hz>` | — | 仅 `varprio`：`configTransferVarPrioTime` 的 Hz（100–3000，例如 1250 ≈ 800 µs）。需要 Host SDK 155。 |
 | `--mtu <bytes>` | auto | 网络 MTU（默认自动检测，巨型帧通常为 9000） |
 | `--pcm-buffer-ms <ms>` | 1000 | PcmRing 总大小 |
 | `--pcm-prefill-ms <ms>` | 500 | 首次拉取前的填充阈值 |
@@ -288,6 +290,7 @@ varmax_cycle x 0.97`（3% 裕度，用于吸收 overhead 推断抖动）比较�
 | `varauto` | VarAuto(cycle) | VarAuto(cycle) |
 | `fixauto` | FixAuto(cycle) | FixAuto(cycle) |
 | `random` | Random(cycle, cycle-min) | Random(cycle, cycle-min) |
+| `varprio` | （必须 `--cycle-hz`） | 只调用 `configTransferVarPrioTime(Hz)`（Host SDK 155+）。忽略 `--cycle-time`。不做一包回退；超 MTU 时由 SDK 一次多包。 |
 
 **`auto` 与 `autofix` 在带 `--cycle-time` 时的唯一区别**：两者都在
 1-packet 上界内承载同一个目标周期，但锚定方式不同：
@@ -301,8 +304,16 @@ varmax_cycle x 0.97`（3% 裕度，用于吸收 overhead 推断抖动）比较�
 两者都落在 `cycle_packets=1`。如果你希望 SDK 报告的周期与你请求值
 精确一致，用 `autofix`；其余情况用 `auto`（默认）。
 
+`varprio` **不是** `fixauto` 的别名。它仍在 VARIABLE 家族（包长基本固定，
+`VarSendRest` 摊整帧余数），参数是 `--cycle-hz` 而不是 `--cycle-time`。
+详见 `docs/varprio-mode.md`。
+
 在 Target Profile 激活时（`--target-profile-limit > 0`），`autofix`
-等同 `fixauto`（`pm.configTransferFixAuto(cycle)`）。
+等同 `fixauto`（`pm.configTransferFixAuto(cycle)`）；`varprio` 调用
+`ProfileMaker::configTransferVarPrioTime(Hz)`。`varmax` / `varauto` /
+`fixauto` / `varprio` 的 ModeType、`cy=` / `fs=` 算法，以及为何
+`--target-profile-limit 200` 与 `0` 在这四条上常常测出同一套几何，见
+`docs/transfer-profile-modes.md`。
 
 #### 读懂 `transfer:` 日志行（`-v`）
 

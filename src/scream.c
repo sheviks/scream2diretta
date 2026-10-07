@@ -111,7 +111,7 @@ static void show_usage(const char *arg0)
   fprintf(stderr, "\n");
   fprintf(stderr, "Diretta target selection:\n");
   fprintf(stderr, "  --target, -t <index>         Select Diretta target by index (1, 2, 3...).\n");
-  fprintf(stderr, "  --list-targets               List available Diretta targets and exit.\n");
+  fprintf(stderr, "  --list-targets               List Diretta targets (sink/Target address, MTU, config, synchro) and exit.\n");
   fprintf(stderr, "\n");
   fprintf(stderr, "Diretta buffering:\n");
   fprintf(stderr, "  --pcm-buffer-ms <ms>         PcmRing length in ms (default 1000, range 50..5000).\n");
@@ -140,9 +140,13 @@ static void show_usage(const char *arg0)
   fprintf(stderr, "  --thread-mode <mode>         SDK thread mode bitmask (default: 1=CRITICAL).\n");
   fprintf(stderr, "  --cycle-time <us>            Max cycle time in microseconds (333-10000).\n");
   fprintf(stderr, "                               Default: auto-calculated from format and MTU.\n");
+  fprintf(stderr, "                               Do not use with --transfer-mode varprio.\n");
+  fprintf(stderr, "  --cycle-hz <Hz>              Cycle rate in Hz for varprio only (100-3000).\n");
+  fprintf(stderr, "                               Example: 1250 = 800us average. Requires SDK 155.\n");
   fprintf(stderr, "  --cycle-min-time <us>        Min cycle time in microseconds (random mode only).\n");
   fprintf(stderr, "  --info-cycle <us>            Info packet cycle in microseconds (default: 100000).\n");
-  fprintf(stderr, "  --transfer-mode <mode>       Transfer mode: auto, varmax, varauto, fixauto, autofix, random.\n");
+  fprintf(stderr, "  --transfer-mode <mode>       Transfer mode: auto, varmax, varauto, fixauto, autofix,\n");
+  fprintf(stderr, "                               random, varprio (SDK 155; requires --cycle-hz).\n");
   fprintf(stderr, "  --target-profile-limit <us>  Target profile limit cycle (0=SelfProfile, default: 0,\n");
   fprintf(stderr, "                               >0=TargetProfile via ProfileMaker(limit=us)).\n");
   fprintf(stderr, "  --mtu <bytes>                MTU override (default: auto-detect).\n");
@@ -249,6 +253,7 @@ static int parse_transfer_mode(const char *s, diretta_transfer_mode_t *out) {
   if (strcmp(s, "fixauto") == 0) { *out = DIRETTA_TM_FIXAUTO; return 0; }
   if (strcmp(s, "random") == 0)  { *out = DIRETTA_TM_RANDOM; return 0; }
   if (strcmp(s, "autofix") == 0) { *out = DIRETTA_TM_AUTOFIX; return 0; }
+  if (strcmp(s, "varprio") == 0) { *out = DIRETTA_TM_VARPRIO; return 0; }
   return 1;
 }
 #endif
@@ -257,6 +262,7 @@ enum {
   OPT_LIST_TARGETS = 1000,
   OPT_THREAD_MODE,
   OPT_CYCLE_TIME,
+  OPT_CYCLE_HZ,
   OPT_CYCLE_MIN_TIME,
   OPT_INFO_CYCLE,
   OPT_TRANSFER_MODE,
@@ -309,6 +315,7 @@ static const struct option long_options[] = {
   { "version",              no_argument,       0, OPT_VERSION },
   { "thread-mode",          required_argument, 0, OPT_THREAD_MODE },
   { "cycle-time",           required_argument, 0, OPT_CYCLE_TIME },
+  { "cycle-hz",              required_argument, 0, OPT_CYCLE_HZ },
   { "cycle-min-time",       required_argument, 0, OPT_CYCLE_MIN_TIME },
   { "info-cycle",           required_argument, 0, OPT_INFO_CYCLE },
   { "transfer-mode",        required_argument, 0, OPT_TRANSFER_MODE },
@@ -503,6 +510,13 @@ int main(int argc, char*argv[]) {
         return 1;
       }
       break;
+    case OPT_CYCLE_HZ:
+      dcfg.cycle_hz = atoi(optarg);
+      if (dcfg.cycle_hz < 100 || dcfg.cycle_hz > 3000) {
+        fprintf(stderr, "--cycle-hz must be 100..3000\n");
+        return 1;
+      }
+      break;
     case OPT_CYCLE_MIN_TIME:
       dcfg.cycle_min_us = atoi(optarg);
       if (dcfg.cycle_min_us < 0) show_usage(argv[0]);
@@ -513,7 +527,7 @@ int main(int argc, char*argv[]) {
       break;
     case OPT_TRANSFER_MODE:
       if (parse_transfer_mode(optarg, &dcfg.transfer_mode) != 0) {
-        fprintf(stderr, "--transfer-mode must be one of: auto, varmax, varauto, fixauto, autofix, random\n");
+        fprintf(stderr, "--transfer-mode must be one of: auto, varmax, varauto, fixauto, autofix, random, varprio\n");
         return 1;
       }
       break;
@@ -810,6 +824,7 @@ int main(int argc, char*argv[]) {
 #else
     case OPT_THREAD_MODE:
     case OPT_CYCLE_TIME:
+    case OPT_CYCLE_HZ:
     case OPT_CYCLE_MIN_TIME:
     case OPT_INFO_CYCLE:
     case OPT_TRANSFER_MODE:
@@ -851,10 +866,32 @@ int main(int argc, char*argv[]) {
   }
 
 #if DIRETTA_ENABLE
+#ifndef DIRETTA_SDK_RELEASE
+#define DIRETTA_SDK_RELEASE 0
+#endif
   // Host SDK SysLog Debug (info rcv / FEEDBACK) is --target-info only.
   // --diretta-debug is the s2d process trace. -v/-vv only raise DLOG / phase.
   if (quiet) dcfg.log_level = DIRETTA_LOG_WARN;
   else dcfg.log_level = DIRETTA_LOG_DEFAULT;
+
+  if (!do_list_targets) {
+    if (dcfg.transfer_mode == DIRETTA_TM_VARPRIO) {
+#if DIRETTA_SDK_RELEASE < 155
+      fprintf(stderr, "--transfer-mode varprio requires Diretta Host SDK 155+\n");
+      return 1;
+#endif
+      if (dcfg.cycle_hz <= 0) {
+        fprintf(stderr, "--transfer-mode varprio requires --cycle-hz <Hz> (100..3000)\n");
+        return 1;
+      }
+      if (dcfg.cycle_us > 0) {
+        fprintf(stderr, "--cycle-time is ignored with --transfer-mode varprio; use --cycle-hz only\n");
+      }
+    } else if (dcfg.cycle_hz > 0) {
+      fprintf(stderr, "--cycle-hz is only valid with --transfer-mode varprio\n");
+      return 1;
+    }
+  }
 
   if (do_list_targets) {
     return diretta_list_targets(&dcfg, argv[0]);

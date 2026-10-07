@@ -230,12 +230,14 @@ sudo ./scream2diretta -t 1 -p 4010 \
 |------|---------|-------------|
 | `-L` | off | Use original 5-byte Scream header (legacy mode). Required for ap2renderer and the original scream-alsa driver, which send byte-interleaved DSD and the legacy rate encoding. |
 | `--target, -t <index>` | 1 | Select Diretta target by 1-based index |
-| `--list-targets` | — | Discover and list targets |
+| `--list-targets` | — | Discover and list targets (sink vs Target address, path/iface MTU, config URL, Synchro) |
 | `-p <port>` | 4010 | UDP port for Scream |
 | `-i <iface>` | — | Bind to specific network interface |
 | `-g <group>` | 239.255.77.77 | Multicast group address (multicast mode only) |
 | `--thread-mode <mask>` | 1 (CRITICAL) | SDK thread mode bitmask |
-| `--transfer-mode <mode>` | auto | auto / varmax / varauto / fixauto / autofix / random (see [Transfer Modes](#transfer-modes)) |
+| `--transfer-mode <mode>` | auto | auto / varmax / varauto / fixauto / autofix / random / varprio (see [Transfer Modes](#transfer-modes)) |
+| `--cycle-time <us>` | auto | Target cycle for VarAuto / FixAuto / VarMax / Random (333–10000). Do not use with `varprio`. |
+| `--cycle-hz <Hz>` | — | `varprio` only: `configTransferVarPrioTime` in Hz (100–3000, e.g. 1250 ≈ 800 µs). Host SDK 155+. |
 | `--mtu <bytes>` | auto | Network MTU (default auto-detect, usually 9000 for jumbo frames) |
 | `--pcm-buffer-ms <ms>` | 1000 | PcmRing total size |
 | `--pcm-prefill-ms <ms>` | 500 | Fill threshold before first pull |
@@ -293,6 +295,7 @@ silently rises to 2.
 | `varauto` | VarAuto(cycle) | VarAuto(cycle) |
 | `fixauto` | FixAuto(cycle) | FixAuto(cycle) |
 | `random` | Random(cycle, cycle-min) | Random(cycle, cycle-min) |
+| `varprio` | (requires `--cycle-hz`) | `configTransferVarPrioTime(Hz)` only — Host SDK 155+. `--cycle-time` is ignored. No 1-packet override; the SDK may send multiple packets per cycle. |
 
 **`auto` vs `autofix` with `--cycle-time`** is the only difference between
 the two: both carry the same target cycle under the 1-packet bound, but
@@ -310,8 +313,16 @@ Both land on `cycle_packets=1`. Use `autofix` when you want the SDK's
 reported cycle to match your requested value exactly; use `auto` (the
 default) otherwise.
 
+`varprio` is **not** an alias of `fixauto`. It stays in the VARIABLE
+family (mostly fixed packet size, `VarSendRest` carries the frame remainder)
+and takes `--cycle-hz` rather than `--cycle-time`. See `docs/varprio-mode.md`.
+
 Under an active Target Profile (`--target-profile-limit > 0`), `autofix`
-is equivalent to `fixauto` (`pm.configTransferFixAuto(cycle)`).
+is equivalent to `fixauto` (`pm.configTransferFixAuto(cycle)`); `varprio`
+calls `ProfileMaker::configTransferVarPrioTime(Hz)`. ModeType, `cy=` / `fs=`
+arithmetic, and why `--target-profile-limit 200` often measures the same
+geometry as `0` for `varmax` / `varauto` / `fixauto` / `varprio` are in
+`docs/transfer-profile-modes.md`.
 
 #### Reading the `transfer:` log line (`-v`)
 

@@ -50,10 +50,10 @@ set(SCREAM2DIRETTA_SOURCES
 #
 # Example:
 #   cmake -DDIRETTA_ENABLE=ON \
-#         -DDIRETTA_SDK_ROOT=/path/to/DirettaHostSDK_150 \
+#         -DDIRETTA_SDK_ROOT=/path/to/DirettaHostSDK_155 \
 #         -DDIRETTA_ARCH_SUFFIX=x64-linux-15v3 ..
 option(DIRETTA_ENABLE "Enable Diretta output" OFF)
-set(DIRETTA_SDK_ROOT "" CACHE PATH "Path to extracted DirettaHostSDK_150 (must contain Host/ and lib/)")
+set(DIRETTA_SDK_ROOT "" CACHE PATH "Path to extracted DirettaHostSDK_150 or _155 (must contain Host/ and lib/)")
 set(DIRETTA_ARCH_SUFFIX "x64-linux-15v3" CACHE STRING "Diretta arch suffix used for libACQUA_<suffix>.a / libDirettaHost_<suffix>.a")
 option(DIRETTA_NOLOG "Link the -nolog SDK variants" OFF)
 
@@ -61,7 +61,7 @@ if (DIRETTA_ENABLE)
   if (NOT DIRETTA_SDK_ROOT OR NOT EXISTS "${DIRETTA_SDK_ROOT}/Host" OR NOT EXISTS "${DIRETTA_SDK_ROOT}/lib")
     message(FATAL_ERROR
       "DIRETTA_ENABLE=ON requires DIRETTA_SDK_ROOT to point at a directory "
-      "containing Host/ and lib/ (the extracted DirettaHostSDK_150).")
+      "containing Host/ and lib/ (extracted DirettaHostSDK_150 or _155).")
   endif ()
   if (DIRETTA_NOLOG)
     set(_diretta_suffix "${DIRETTA_ARCH_SUFFIX}-nolog")
@@ -76,6 +76,16 @@ if (DIRETTA_ENABLE)
   if (NOT EXISTS "${_diretta_libACQUA}")
     message(FATAL_ERROR "ACQUA SDK library not found: ${_diretta_libACQUA}")
   endif ()
+  set(DIRETTA_SDK_RELEASE 0)
+  if (EXISTS "${DIRETTA_SDK_ROOT}/Host/Release.hpp")
+    file(STRINGS "${DIRETTA_SDK_ROOT}/Host/Release.hpp" _diretta_rel_lines REGEX "ReleaseNo")
+    foreach (_line IN LISTS _diretta_rel_lines)
+      if (_line MATCHES "ReleaseNo = ([0-9]+)")
+        set(DIRETTA_SDK_RELEASE "${CMAKE_MATCH_1}")
+      endif ()
+    endforeach ()
+  endif ()
+  message(STATUS "Diretta Host SDK ReleaseNo=${DIRETTA_SDK_RELEASE} (${DIRETTA_SDK_ROOT})")
 endif ()
 
 # Helper: define one scream2diretta target with the shared option matrix.
@@ -95,6 +105,8 @@ function(scream2diretta_define_target target_name no_diag)
   if (DIRETTA_ENABLE)
     target_sources(${target_name} PRIVATE src/diretta.cpp src/diretta_sync.cpp)
     target_include_directories(${target_name} PRIVATE "${DIRETTA_SDK_ROOT}/Host")
+    target_compile_definitions(${target_name} PRIVATE
+        DIRETTA_SDK_RELEASE=${DIRETTA_SDK_RELEASE})
     target_link_libraries(${target_name}
       -Wl,--start-group
       "${_diretta_libDiretta}"

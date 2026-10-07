@@ -14,6 +14,7 @@ PORT=4011
 #   SCREAM2DIRETTA_OPTS="-i eth0 --stats --stats-interval 5 -vv"
 #   SCREAM2DIRETTA_OPTS="--pcm-buffer-ms 1000 --pcm-prefill-ms 500 --rebuffer-percent 50"
 #   SCREAM2DIRETTA_OPTS="--thread-mode 16641 --transfer-mode auto"
+#   SCREAM2DIRETTA_OPTS="--transfer-mode varprio --cycle-hz 1250"  # SDK 155
 #
 # For best sound quality, also consider:
 #   --cpu-scream 2 --cpu-audio 3 --cpu-other 1

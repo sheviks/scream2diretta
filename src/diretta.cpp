@@ -47,6 +47,10 @@ extern "C" {
 #include <thread>
 #include <vector>
 
+#ifndef DIRETTA_SDK_RELEASE
+#define DIRETTA_SDK_RELEASE 0
+#endif
+
 #if !defined(_WIN32)
 #include <unistd.h>
 #endif
@@ -920,17 +924,33 @@ static void init_syslog(const diretta_config_t& cfg) {
 struct DiscoveredTarget {
     IPAddress portAddr;
     Find::TargetConnectInfo info;
+    bool have_device;
+    Find::FindTargetSt device;
 };
 
 static bool enumerate_targets(Find& finder, std::vector<DiscoveredTarget>& out) {
+    Find::TargetResalts devices;
     Find::PortResalts ports;
-    if (!finder.findOutput(ports)) {
+    if (!finder.findTarget(devices)) {
+        return false;
+    }
+    if (!finder.findOutput(devices, ports)) {
         return false;
     }
     out.clear();
     out.reserve(ports.size());
     for (const auto& kv : ports) {
-        out.push_back({ kv.first, kv.second });
+        DiscoveredTarget t;
+        t.portAddr = kv.first;
+        t.info = kv.second;
+        t.have_device = false;
+        t.device = Find::FindTargetSt();
+        const auto it = devices.find(t.info.TargetAddress);
+        if (it != devices.end()) {
+            t.have_device = true;
+            t.device = it->second;
+        }
+        out.push_back(t);
     }
     return true;
 }
@@ -1308,6 +1328,15 @@ static const char* apply_transfer_mode(Sync& sb,
                 pm.configTransferVarAuto(cycle);
                 name = "profile-varauto";
                 break;
+            case DIRETTA_TM_VARPRIO:
+#if DIRETTA_SDK_RELEASE >= 155
+                if (cfg.cycle_hz > 0) {
+                    pm.configTransferVarPrioTime(static_cast<std::uint32_t>(cfg.cycle_hz));
+                    out_effective_cycle_us = 1000000u / static_cast<unsigned int>(cfg.cycle_hz);
+                }
+#endif
+                name = "profile-varprio";
+                break;
             case DIRETTA_TM_AUTO:
             default:
                 pm.configTransferAuto(cycle);
@@ -1336,6 +1365,18 @@ static const char* apply_transfer_mode(Sync& sb,
         case DIRETTA_TM_RANDOM:
             sb.configTransferRandom(cycle, cycleMin, /*fragments*/ 1);
             return "random";
+        case DIRETTA_TM_VARPRIO: {
+#if DIRETTA_SDK_RELEASE >= 155
+            const unsigned int hz = static_cast<unsigned int>(cfg.cycle_hz);
+            if (hz > 0) {
+                out_effective_cycle_us = 1000000u / hz;
+                if (!sb.configTransferVarPrioTime(hz)) {
+                    DLOG(0, "configTransferVarPrioTime(%u) failed", hz);
+                }
+            }
+#endif
+            return "varprio";
+        }
         case DIRETTA_TM_AUTOFIX: {
             // AUTOFIX: cycle-anchored variant of AUTO. This is the legacy
             // auto+cycletime behaviour, kept as an explicit mode so callers
@@ -1880,7 +1921,11 @@ static uint32_t open_sync_worker_blocking(scream_diretta::ScreamDirettaSync*& ou
                     /*cpuMain*/ sdk_cpu_main,
                     /*cpuOther*/ sdk_cpu_other,
                     /*rngOther*/ 0,
-                    Sync::MSMODE_AUTO)) {
+                    Sync::MSMODE_AUTO
+#if DIRETTA_SDK_RELEASE >= 155
+                    , /*diswork*/ false
+#endif
+                    )) {
         DLOG(0, "Sync::open() failed");
         dbg_event("sdk_sync_open_return", "result=fail");
         delete sync;
@@ -2054,18 +2099,56 @@ static uint32_t open_sync_worker_blocking(scream_diretta::ScreamDirettaSync*& ou
             dbg_event("sink_info",
                       "supportPCM=0x%x latencyBuf=%u latencyMax=%u latencyHw=%u "
                       "maxSize=%u%s(min=%u,req=%u,max=%u)[inferred_overhead=%s] "
+#if DIRETTA_SDK_RELEASE >= 155
+                      "synchro=%s ms=%s%s%s%s raw=%d",
+#else
                       "supportMSmode=0x%x",
+#endif
                       (unsigned)si.supportPCM, (unsigned)si.latencyBuffer,
                       (unsigned)si.latencyMax, (unsigned)si.latencyHw,
                       (unsigned)si.maxSize, maxSize_unset ? "(unset)" : "",
                       (unsigned)si.minMTU, (unsigned)si.reqMTU, (unsigned)si.maxMTU,
                       maxSize_unset ? "N/A" : std::to_string(inferred_overhead).c_str(),
-                      (unsigned)si.supportMSmode);
+#if DIRETTA_SDK_RELEASE >= 155
+                      si.checkSinkSupportSynchro() ? "yes" : "no",
+                      si.checkSinkSupportMSmode1() ? "MS1" : "",
+                      si.checkSinkSupportMSmode2() ? " MS2" : "",
+                      si.checkSinkSupportMSmode3() ? " MS3" : "",
+                      si.checkSinkSupportMSmode() ? "" : "none",
+                      si.SynchroSupport
+#else
+                      (unsigned)si.supportMSmode
+#endif
+                      );
         }
         if (verbosity >= 2) {
-            // supportMSmode is a Target capability bitmask (bit0=MS1, bit1=MS2,
-            // bit2=MS3), not the live connection mode. The negotiated mode is
-            // logged from is_MSmode() after connectWait / online poll.
+            // Target capability from inquiry, not the live connection mode.
+            // Negotiated mode is logged from is_MSmode() after connectWait.
+#if DIRETTA_SDK_RELEASE >= 155
+            // 155: SynchroSupport is signed (-1 = no/unknown Synchro, 0 =
+            // Synchro but no MS bits, otherwise MS1/2/3 flags). Helpers
+            // decode that; s2d does not change open() MSMODE_AUTO.
+            DLOG(2, "sink caps: pcm=0x%x dsd_lsb=%s dsd_msb=%s "
+                 "synchro=%s ms_supported:%s%s%s%s (raw=%d) latency_buf=%uus "
+                 "latency_max=%uus latency_hw=%uus max_mtu=%u max_payload=%u%s "
+                 "inferred_overhead=%s",
+                 (unsigned)si.supportPCM,
+                 si.checkSinkSupportDSDlsb() ? "yes" : "no",
+                 si.checkSinkSupportDSDmsb() ? "yes" : "no",
+                 si.checkSinkSupportSynchro() ? "yes" : "no",
+                 si.checkSinkSupportMSmode1() ? " MS1" : "",
+                 si.checkSinkSupportMSmode2() ? " MS2" : "",
+                 si.checkSinkSupportMSmode3() ? " MS3" : "",
+                 si.checkSinkSupportMSmode() ? "" : " none",
+                 si.SynchroSupport,
+                 (unsigned)si.latencyBuffer * 100u,
+                 (unsigned)si.latencyMax * 100u,
+                 (unsigned)si.latencyHw * 100u,
+                 (unsigned)si.maxMTU,
+                 (unsigned)si.maxSize,
+                 maxSize_unset ? "(unset)" : "",
+                 maxSize_unset ? "N/A" : std::to_string(inferred_overhead).c_str());
+#else
             const uint16_t msm = si.supportMSmode;
             DLOG(2, "sink caps: pcm=0x%x dsd_lsb=%s dsd_msb=%s "
                  "ms_supported:%s%s%s (0x%x) latency_buf=%uus latency_max=%uus "
@@ -2084,13 +2167,14 @@ static uint32_t open_sync_worker_blocking(scream_diretta::ScreamDirettaSync*& ou
                  (unsigned)si.maxSize,
                  maxSize_unset ? "(unset)" : "",
                  maxSize_unset ? "N/A" : std::to_string(inferred_overhead).c_str());
+#endif
         }
     }
     dbg_event("inquirySupportFormat_return", "");
 
     dbg_event("setConfigTransfer_begin",
-              "mode=%d cycle_us=%d cycle_min_us=%d info_cycle_us=%d profile_limit_us=%d",
-              (int)cfg.transfer_mode, cfg.cycle_us, cfg.cycle_min_us,
+              "mode=%d cycle_us=%d cycle_hz=%d cycle_min_us=%d info_cycle_us=%d profile_limit_us=%d",
+              (int)cfg.transfer_mode, cfg.cycle_us, cfg.cycle_hz, cfg.cycle_min_us,
               cfg.info_cycle_us, cfg.target_profile_limit_us);
     unsigned int applied_cycle_us = 0;
     const char* applied_mode = apply_transfer_mode(*sync, cfg,
@@ -2146,12 +2230,18 @@ static uint32_t open_sync_worker_blocking(scream_diretta::ScreamDirettaSync*& ou
             } else {
                 min_cycle_buf[0] = '\0';
             }
+            char hz_buf[32];
+            if (cfg.cycle_hz > 0) {
+                snprintf(hz_buf, sizeof(hz_buf), " cycle_hz=%d", cfg.cycle_hz);
+            } else {
+                hz_buf[0] = '\0';
+            }
             DLOG(1, "transfer: mtu=%u mode=%s mode_sdk=%s target_cycle=%dus "
-                 "sdk_cycle=%lldus cycle_size=%zuB cycle_packets=%zu%s",
+                 "sdk_cycle=%lldus cycle_size=%zuB cycle_packets=%zu%s%s",
                  (unsigned)eff_mtu, applied_mode, mode_sdk, target_cycle, sdk_cycle,
                  (size_t)sync->getCycleSize(),
                  (size_t)sync->getCyclePackets(),
-                 min_cycle_buf);
+                 min_cycle_buf, hz_buf);
         }
 
         g_st.target_cycle_us = static_cast<uint64_t>(target_cycle);
@@ -3249,6 +3339,7 @@ extern "C" void diretta_config_init(diretta_config_t *cfg) {
     cfg->target_index = 0;
     cfg->thread_mode = 1u; // CRITICAL
     cfg->cycle_us = 0;
+    cfg->cycle_hz = 0;
     cfg->cycle_min_us = 0;
     cfg->info_cycle_us = 100000;
     cfg->transfer_mode = DIRETTA_TM_AUTO;
@@ -3347,29 +3438,60 @@ extern "C" int diretta_list_targets(const diretta_config_t *cfg, const char *pro
 
     std::printf("\n════════════════════════════════════════════════════════\n");
     std::printf("  Scanning for Diretta Targets...\n");
+#if DIRETTA_SDK_RELEASE > 0
+    std::printf("  Host SDK %d\n", DIRETTA_SDK_RELEASE);
+#endif
     std::printf("════════════════════════════════════════════════════════\n\n");
     std::printf("Available Diretta Targets (%zu found):\n\n", targets.size());
 
     for (size_t i = 0; i < targets.size(); ++i) {
         const auto& t = targets[i];
-        const std::string addr = ip_to_str(t.portAddr);
+        const std::string sink_addr = ip_to_str(t.portAddr);
+        const std::string target_addr = ip_to_str(t.info.TargetAddress);
         const std::string targetName = t.info.targetName.empty()
             ? (t.info.outputName.empty() ? "<unnamed>" : t.info.outputName)
             : t.info.targetName;
         const std::string& outputName = t.info.outputName;
 
-        uint32_t mtu = 0;
-        finder.measSendMTU(t.portAddr, mtu);
+        uint32_t path_mtu = 0;
+        uint32_t if_mtu = 0;
+        if (!finder.measSendMTU(t.portAddr, path_mtu, if_mtu)) {
+            finder.measSendMTU(t.portAddr, path_mtu);
+        }
+
+        std::string config = t.info.config;
+#if DIRETTA_SDK_RELEASE >= 155
+        if (config.empty() && t.have_device && !t.device.ConfigURL.empty()) {
+            config = t.device.ConfigURL;
+        }
+#endif
 
         std::printf("[%zu] %s\n", i + 1, targetName.c_str());
         if (!outputName.empty() && outputName != targetName) {
             std::printf("    Output: %s\n", outputName.c_str());
         }
-        std::printf("    Address: %s", addr.c_str());
-        if (mtu > 0) {
-            std::printf("  MTU: %u", mtu);
+        std::printf("    Sink: %s", sink_addr.c_str());
+        if (path_mtu > 0) {
+            std::printf("  path MTU %u", path_mtu);
+        }
+        if (if_mtu > 0 && if_mtu != path_mtu) {
+            std::printf("  iface MTU %u", if_mtu);
         }
         std::printf("\n");
+        if (!target_addr.empty() && target_addr != sink_addr &&
+            target_addr != "<addr>") {
+            std::printf("    Target: %s\n", target_addr.c_str());
+        }
+#if DIRETTA_SDK_RELEASE >= 155
+        if (t.have_device && t.device.ActiveMTU > 0 &&
+            t.device.ActiveMTU != path_mtu) {
+            std::printf("    Discovery MTU: %u\n",
+                        (unsigned)t.device.ActiveMTU);
+        }
+#endif
+        if (!config.empty()) {
+            std::printf("    Config: %s\n", config.c_str());
+        }
         std::printf("    Port: IN=%u OUT=%u",
                     static_cast<unsigned>(t.info.PI),
                     static_cast<unsigned>(t.info.PO));
@@ -3377,6 +3499,15 @@ extern "C" int diretta_list_targets(const diretta_config_t *cfg, const char *pro
             std::printf(" (multiport)");
         }
         std::printf("\n");
+        if (t.info.Sync.isEnable()) {
+            std::printf("    Synchro: hash=%u total=%u all=%u self=%u\n",
+                        (unsigned)t.info.Sync.Hash,
+                        (unsigned)t.info.Sync.Total,
+                        (unsigned)t.info.Sync.All,
+                        (unsigned)t.info.Sync.Self);
+        } else {
+            std::printf("    Synchro: no\n");
+        }
         std::printf("    Version: %u\n",
                     static_cast<unsigned>(t.info.version));
         std::printf("    ProductID: 0x%016llX\n",
@@ -3493,12 +3624,13 @@ extern "C" int diretta_output_init(const diretta_config_t *cfg) {
             case DIRETTA_TM_FIXAUTO: tmode_name = "fixauto"; break;
             case DIRETTA_TM_RANDOM:  tmode_name = "random"; break;
             case DIRETTA_TM_AUTOFIX: tmode_name = "autofix"; break;
+            case DIRETTA_TM_VARPRIO: tmode_name = "varprio"; break;
         }
-        DLOG(1, "SDK config: thread_mode=0x%x cycle_time_us=%d "
+        DLOG(1, "SDK config: thread_mode=0x%x cycle_time_us=%d cycle_hz=%d "
              "cycle_min_time_us=%d info_cycle_us=%d transfer_mode=%s "
              "target_profile_limit_us=%d mtu_override=%d",
              g_st.cfg.thread_mode != 0 ? g_st.cfg.thread_mode : 1u,
-             g_st.cfg.cycle_us, g_st.cfg.cycle_min_us,
+             g_st.cfg.cycle_us, g_st.cfg.cycle_hz, g_st.cfg.cycle_min_us,
              g_st.cfg.info_cycle_us, tmode_name,
              g_st.cfg.target_profile_limit_us,
              g_st.cfg.mtu_override);

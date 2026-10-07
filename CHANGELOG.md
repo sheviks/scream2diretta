@@ -10,6 +10,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **Docs: Target Profile send modes and `cy=` / `fs=`.**
+  `docs/transfer-profile-modes.md` records `varmax` / `varauto` /
+  `fixauto` / `varprio` under `--target-profile-limit > 0` (`ModeType`,
+  syslog `cy=` vs `fs=`, worked examples) and why `limit=200` often
+  matches SelfProfile geometry when the cap sits idle. (`README.md`,
+  `README_CN.md`, `docs/varprio-mode.md`)
+- **`--transfer-mode varprio --cycle-hz <Hz>` (Host SDK 155).** Calls
+  `configTransferVarPrioTime` with integer Hz (100–3000) and does not
+  fall back to VarMax/VarAuto. Oversized cycles are left to the SDK
+  (multiple packets per cycle). `--cycle-time` is ignored for this mode.
+  150 builds still compile; selecting `varprio` errors out. `install.sh`
+  prefers `DirettaHostSDK_155` when present. (`diretta.cpp`, `scream.c`,
+  `diretta.h`, `scripts/install.sh`)
+- **`--list-targets` prints sink vs Target address, path/interface MTU,
+  config URL, and Synchro group.** Discovery still uses `measSendMTU` on
+  the sink port (no `MeasureMtu`). SDK 155 also shows `ConfigURL` /
+  discovery `ActiveMTU` when the Find device record has them.
+  (`diretta.cpp`)
+- **SDK 155 sink-capability log.** `-vv` / `--diretta-debug` print Target
+  Synchro plus MS1/MS2/MS3 via `checkSinkSupportMSmode*()`, including the
+  155 sentinel `SynchroSupport=-1` (no/unknown Synchro vs Synchro with no
+  MS bits). Live negotiated mode is still `is_MSmode()` after connect.
+  150 builds keep the old bitmask line. `Sync::open` passes `diswork=false`
+  when `ReleaseNo>=155` so the 155 header compiles; disconnect behaviour
+  is unchanged. (`diretta.cpp`, `CMakeLists.txt`)
+
 - **Split logging into four independent streams.** Default (no `-v`) is
   state changes only (`ready`, `format`, `playing`, reconnect-after-loss,
   idle release, underrun, errors). `-v` is the per-open summary including
