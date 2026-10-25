@@ -2585,6 +2585,24 @@ static bool start_async_sync_open(const FormatConfigure& fc, const char* reason)
             pthread_setschedparam(pthread_self(), SCHED_OTHER, &sp);
         }
         ::nice(-10);
+
+        // Pin to --cpu-other (housekeeping core) if specified, so this blocking
+        // SDK handshake work does not compete with the receiver on --cpu-scream.
+        // If cpu_other is unset, leave the thread unpinned so the kernel scheduler
+        // can float it to any available core — often better than forcing it onto
+        // a real-time core.
+        if (g_st.cfg.cpu_other >= 0) {
+            cpu_set_t cpuset;
+            CPU_ZERO(&cpuset);
+            CPU_SET(g_st.cfg.cpu_other, &cpuset);
+            if (pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset) != 0) {
+                std::fprintf(stderr,
+                    "[diretta] WARNING: async open worker: failed to pin to CPU %d (errno=%d)\n",
+                    g_st.cfg.cpu_other, errno);
+            } else {
+                DLOG(2, "Async open worker pinned to CPU %d", g_st.cfg.cpu_other);
+            }
+        }
 #endif
         scream_diretta::ScreamDirettaSync* sync_local = nullptr;
         const uint32_t accepted_bits = open_sync_worker_blocking(
@@ -2696,6 +2714,23 @@ static void cleanup_sync_async(scream_diretta::ScreamDirettaSync* old,
             pthread_setschedparam(pthread_self(), SCHED_OTHER, &sp);
         }
         ::nice(-10);
+
+        // Pin to --cpu-other (housekeeping core) if specified, so this cleanup
+        // work does not compete with the receiver on --cpu-scream. If unset,
+        // leave unpinned.
+        if (g_st.cfg.cpu_other >= 0) {
+            cpu_set_t cpuset;
+            CPU_ZERO(&cpuset);
+            CPU_SET(g_st.cfg.cpu_other, &cpuset);
+            if (pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset) != 0) {
+                std::fprintf(stderr,
+                    "[diretta] WARNING: cleanup worker: failed to pin to CPU %d (errno=%d)\n",
+                    g_st.cfg.cpu_other, errno);
+            }
+            // No DLOG here — cleanup is detached and may run after DLOG subsystem
+            // is torn down. The error fprintf above is safe because stderr is
+            // always valid until process exit.
+        }
 #endif
         const auto t0 = std::chrono::steady_clock::now();
         try {
@@ -3407,6 +3442,67 @@ extern "C" void diretta_config_init(diretta_config_t *cfg) {
     cfg->startup_fade_shape = 0; /* linear */
 }
 
+// Validate CPU affinity configuration to catch obvious conflicts.
+// Called early (before target discovery) so invalid configs are rejected
+// immediately rather than after a long handshake.
+static void validate_cpu_affinity_config(const diretta_config_t& cfg) {
+    // If neither scream nor audio affinity is set, nothing to check.
+    if (cfg.cpu_scream < 0 && cfg.cpu_audio < 0) {
+        return;
+    }
+
+    // P0: Detect scream == audio (fatal conflict)
+    // Both threads are SCHED_FIFO RT and would compete for the same core,
+    // causing constant context switches (~1-5µs each) and audio glitches.
+    if (cfg.cpu_scream >= 0 && cfg.cpu_scream == cfg.cpu_audio) {
+        std::fprintf(stderr,
+            "\n"
+            "════════════════════════════════════════════════════════════════\n"
+            "  ERROR: CPU Affinity Configuration Conflict\n"
+            "════════════════════════════════════════════════════════════════\n"
+            "\n"
+            "  --cpu-scream=%d and --cpu-audio=%d are both set to the same core.\n"
+            "\n"
+            "  Why this fails:\n"
+            "    Both threads run at RT priority (SCHED_FIFO) and would compete\n"
+            "    for the same CPU, causing constant context switches (~1-5µs each)\n"
+            "    and audio glitches (underruns, dropouts).\n"
+            "\n"
+            "  How to fix:\n"
+            "    1. Auto-configure (recommended):\n"
+            "         sudo ./scripts/diagnose-system.sh\n"
+            "\n"
+            "    2. Manual configuration:\n"
+            "         --cpu-scream=3 --cpu-audio=2 --cpu-other=0\n"
+            "       (allocate each hot-path thread to a different core)\n"
+            "\n"
+            "    3. Let threads float (removes explicit pinning):\n"
+            "         Remove both --cpu-scream and --cpu-audio\n"
+            "       (threads will be scheduled by the kernel)\n"
+            "\n"
+            "════════════════════════════════════════════════════════════════\n"
+            "\n",
+            cfg.cpu_scream, cfg.cpu_audio);
+        std::exit(1);
+    }
+
+    // Detect audio == other (warning, not fatal)
+    // SDK audio worker is SCHED_FIFO, helpers are SCHED_OTHER (CFS).
+    // RT will preempt CFS, so audio worker is not delayed — only helpers
+    // may be starved, which is acceptable (they handle control plane, not
+    // audio data). Still warn in case the user wants optimal isolation.
+    if (cfg.cpu_audio >= 0 && cfg.cpu_audio == cfg.cpu_other) {
+        std::fprintf(stderr,
+            "[diretta] WARNING: --cpu-audio=%d and --cpu-other=%d overlap\n"
+            "  RT audio worker (SCHED_FIFO) will preempt helper threads (SCHED_OTHER).\n"
+            "  Audio should not be affected, but helpers may be delayed.\n"
+            "  Consider isolating them: e.g. --cpu-audio=2 --cpu-other=0\n"
+            "\n",
+            cfg.cpu_audio, cfg.cpu_other);
+        // Continue (non-fatal)
+    }
+}
+
 extern "C" int diretta_list_targets(const diretta_config_t *cfg, const char *progname) {
     diretta_config_t local;
     if (cfg) local = *cfg; else diretta_config_init(&local);
@@ -3535,6 +3631,10 @@ extern "C" int diretta_output_init(const diretta_config_t *cfg) {
     if (cfg) g_st.cfg = *cfg; else diretta_config_init(&g_st.cfg);
 
     init_syslog(g_st.cfg);
+
+    // Validate CPU affinity early (before target discovery) so invalid
+    // configs are rejected immediately.
+    validate_cpu_affinity_config(g_st.cfg);
 
     if (g_st.cfg.diretta_debug) {
         std::fprintf(stderr,
